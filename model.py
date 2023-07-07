@@ -6,12 +6,17 @@ os.environ["MKL_NUM_THREADS"] = f"{n_threads}"
 os.environ["VECLIB_MAXIMUM_THREADS"] = f"{n_threads}"
 os.environ["NUMEXPR_NUM_THREADS"] = f"{n_threads}"
 
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 import tensorflow as tf
 import tensorflow_probability as tfp
 
 from sklearn.preprocessing import LabelEncoder
 from tqdm import tqdm
+
+from utils import alphabet_size
 
 
 tf.config.threading.set_inter_op_parallelism_threads(
@@ -264,8 +269,8 @@ class AIRRTM:
     
     def get_topic_proportion_matrix(self):
         return self.sample_topic_proportions_layer.get_weights()[0]
-    
-    def load_model(self, tf_model):
+
+    def from_tf_model(self, tf_model):
         self.model = tf_model
         self.sample_topic_proportions_layer = [l for l in tf_model.layers if l.name == 'topic_proportions'][0]
         self.latent_space_to_topic_proportions_layer = [l for l in tf_model.layers if l.name == 'latent_to_topics'][0]
@@ -279,22 +284,34 @@ class AIRRTM:
             l for l in tf_model.layers if isinstance(l, tf.keras.layers.TimeDistributed)
         ][0]
 
+    def encode_sequences(self, seqs):
+        encoded_seq_1 = self.encode_layer(seqs)
+        encoded_seq_2 = self.encode_layer_2(seqs)
+        encoded_seq = tf.concat([encoded_seq_1, encoded_seq_2], axis=-1)
+        z_mean = self.pre_z_mean_layer_act(encoded_seq)
+        z_mean = self.z_mean_layer(z_mean)
+        return z_mean
 
-def encode_sequences(seqs, model):
-    encoded_seq_1 = model.encode_layer(seqs)
-    encoded_seq_2 = model.encode_layer_2(seqs)
-    encoded_seq = tf.concat([encoded_seq_1, encoded_seq_2], axis=-1)
-    z_mean = model.pre_z_mean_layer_act(encoded_seq)
-    z_mean = model.z_mean_layer(z_mean)
-    return z_mean
+    def decode_sequences(self, encoded_seqs):
+        decoded_sequence = self.decode_repeating_layer(encoded_seqs)
+        decoded_sequence = self.decode_lstm_layer(decoded_sequence)
+        decoded_sequence = self.decode_dense_layer(decoded_sequence)
+        return decoded_sequence
 
+    def predict_topic_probs(self, seqs):
+        return self.latent_space_to_topic_proportions_layer(
+            self.encode_sequences(seqs)
+        ).numpy()
 
-def decode_sequences(encoded_seqs, model):
-    decoded_sequence = model.decode_repeating_layer(encoded_seqs)
-    decoded_sequence = model.decode_lstm_layer(decoded_sequence)
-    decoded_sequence = model.decode_dense_layer(decoded_sequence)
-    return decoded_sequence
-
+    def predict_signal_intensity(self, seqs):
+        sample_topic_p = tf.keras.activations.softmax(self.sample_topic_proportions_layer.weights[0]).numpy()
+        sample_topic_p_df = pd.DataFrame(sample_topic_p)
+        topic_diffs = sample_topic_p_df.iloc[self.n_samples // 2:].mean(axis=0) - sample_topic_p_df.iloc[:self.n_samples // 2].mean(axis=0)
+        best_topic_id = topic_diffs.argmax()
+        topic_diffs_weights = topic_diffs.abs() / topic_diffs.abs().sum() * topic_diffs / topic_diffs.abs()
+        predicted_topics = self.predict_topic_probs(seqs)
+        signal_intensity = (predicted_topics  * topic_diffs_weights.to_numpy()).sum(axis=1)
+        return signal_intensity
 
 def seq_tensor_to_seq(seq_tensor):
     alphabet_encoder = LabelEncoder()
@@ -303,22 +320,65 @@ def seq_tensor_to_seq(seq_tensor):
     sequences = [''.join(alphabet_encoder.inverse_transform(s)) for s in m]
     return sequences
 
-# def sample_from_topic(topic_ids, topic_desired_values, model, scale_coef):
-#     ww = model.latent_space_to_topic_proportions_layer.weights[0].numpy()[:, topic_ids].T
-#     intercept = model.latent_space_to_topic_proportions_layer.weights[1].numpy()[topic_ids]
-#     if len(topic_ids) < ww.shape[1]:
-#         ww = np.vstack([
-#             ww,
-#             [np.arange(ww.shape[1]) * 1e-9 + i * 1e-9 for i in range(ww.shape[1] - len(topic_ids))]
-#         ])
-#     # b = np.array([1e5 for i in range(w.shape[0])])
-#     b = np.array(topic_desired_values + [0] * (ww.shape[1] - len(topic_ids)))
-#     x = np.linalg.solve(ww, b)
-#     print(ww.shape, b.shape)
-#     print(expit(np.matmul(ww, x.T)[:len(topic_ids)] + intercept).round(3))
-#     x /= (x**2).sum()**0.5
-#     print(x)
-#     x *= scale_coef
-#     print(expit(np.matmul(ww, x.T)[:len(topic_ids)] + intercept).round(3))
-#     return x
 
+def get_default_model(max_len, n_samples):
+    tm_coef = 0.995
+    vae_coef = 1 - tm_coef
+
+    tm_likelihood_coef=0.99
+    label_likelihood_coef=(1.0 - tm_likelihood_coef)
+
+    reconstruction_loss_coef=0.95
+    kl_coef=(1.0 - reconstruction_loss_coef)
+
+    decorrelation_regularizer_coef = 0.01
+
+    n_topics_signal = 4
+    n_topics_nonsignal = 4
+    n_topics = n_topics_signal + n_topics_nonsignal
+    latent_dim = 70
+    airrtm_model = AIRRTM(
+        max_len=max_len,
+        n_samples=n_samples,
+        n_topics_signal=n_topics_signal,
+        n_topics_nonsignal=n_topics_nonsignal,
+        latent_dim=latent_dim,
+        decorrelation_regularizer_coef=decorrelation_regularizer_coef,
+        entropy_regularizer_coef=0.0,
+        topic_proportions_l2_coef=1e-4,
+        tm_likelihood_coef=tm_coef * tm_likelihood_coef,
+        label_likelihood_coef=tm_coef * label_likelihood_coef,
+        reconstruction_loss_coef=vae_coef * reconstruction_loss_coef,
+        kl_coef=vae_coef * kl_coef / latent_dim,
+        latent_space_to_topic_proportions_coef=1e-3,
+    )
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        initial_learning_rate=1e-3,
+        decay_steps=50000,
+        decay_rate=0.5
+    )
+    airrtm_model.compile_model(lr=lr_schedule)
+    return airrtm_model
+
+
+def load_model(model_file, max_len, n_samples):
+    airrtm_model = get_default_model(max_len, n_samples)
+    custom_objects = {
+        "SamplingLayer": AIRRTM.SamplingLayer,
+        "<lambda>": lambda M: AIRRTM.topic_proportions_reg(
+            M,
+            airrtm_model.entropy_regularizer_coef,
+            airrtm_model.decorrelation_regularizer_coef,
+            airrtm_model.topic_proportions_l2_coef
+        ),
+    }
+    with tf.keras.utils.custom_object_scope(custom_objects):
+        tf_model = tf.keras.models.load_model(model_file)
+    airrtm_model.from_tf_model(tf_model)
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        initial_learning_rate=1e-3,
+        decay_steps=50000,
+        decay_rate=0.5
+    )
+    airrtm_model.compile_model(lr=lr_schedule)
+    return airrtm_model

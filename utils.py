@@ -3,6 +3,7 @@ import numpy as np
 
 from Bio import SeqIO, Seq
 from sklearn.preprocessing import LabelEncoder
+from tqdm import tqdm
 
 
 alphabet_aa = [
@@ -37,10 +38,9 @@ def preprocess_seq_list(seqs, max_len, alphabet):
     return res
 
 
-def load_data(input_data_dir, witness_rate, max_len, alphabet, n_samples, n_seq=None):
+def load_data(input_data_dir, witness_rate, max_len, alphabet, n_samples, n_seq=None, translate=True):
     repertoires = []
     signal_seqs_ids = []
-    header = ["nt_seq", "aa_seq", "V_segment", "J_segment"]
     for i in tqdm(range(n_samples // 2)):
         records = SeqIO.parse(f"{input_data_dir}/samples/{witness_rate}/{i}_neg.fasta", format="fasta")
         records = [str(s.seq) for s in records]
@@ -56,14 +56,17 @@ def load_data(input_data_dir, witness_rate, max_len, alphabet, n_samples, n_seq=
             records = records[:n_seq]
         repertoires.append(records)
         continue
-    repertoires_aa = [[str(Seq.Seq(s).translate()) for s in r] for r in tqdm(repertoires)]
+    if translate:
+        repertoires_aa = [[str(Seq.Seq(s).translate()) for s in r] for r in tqdm(repertoires)]
+    else:
+        repertoires_aa = [[s for s in r] for r in repertoires]
     samples = [preprocess_seq_list(r, alphabet=alphabet, max_len=max_len) for r in tqdm(repertoires_aa)]
     return samples, repertoires_aa
 
 
 def create_input_tensors(samples):
-    n_samples = samples.shape[0]
-    n_seq = samples.shape[1]
+    n_samples = len(samples)
+    n_seq = len(samples[0])
     dataset_repertoire_id = np.repeat(np.arange(n_samples), n_seq)
     dataset_tm_target = np.ones(n_samples * n_seq)
     dataset_kl_target = np.zeros(n_samples * n_seq)
