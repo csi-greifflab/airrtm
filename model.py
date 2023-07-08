@@ -248,7 +248,7 @@ class AIRRTM:
         )
 
     def fit_model(self, batch_size, epochs, input_data, callbacks=[]):
-        dataset_seq, dataset_repertoire_id, dataset_tm_target, dataset_kl_target, dataset_repertoire_label = input_data
+        dataset_seq, dataset_repertoire_id, dataset_tm_target, dataset_kl_target, dataset_repertoire_label, sample_labels, sample_sizes = input_data
         self.model.fit(
             x={
                 "sequence_input": dataset_seq,

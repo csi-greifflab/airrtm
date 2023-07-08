@@ -17,7 +17,7 @@ def main():
     parser.add_argument('--input_data_dir', required=True)
     args = parser.parse_args()
 
-    truncated_samples, repertoires_aa = load_data(
+    samples, repertoires_aa, sample_labels = load_data(
         witness_rate=args.witness_rate,
         input_data_dir=args.input_data_dir,
         max_len=args.max_len,
@@ -25,7 +25,7 @@ def main():
         n_samples=args.n_samples,
         n_seq=args.n_seq,
     )
-    input_data = create_input_tensors(truncated_samples)
+    input_data = create_input_tensors(samples, sample_labels)
 
     repertoires_dir = Path(f'{args.input_data_dir}/repertoires_aa/{args.witness_rate}.pickle')
     repertoires_dir.parent.mkdir(parents=True, exist_ok=True)

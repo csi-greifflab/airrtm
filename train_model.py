@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 
 from model import get_default_model, load_model
+from utils import generate_random_sample_ids
 
 
 def main():
@@ -25,7 +26,6 @@ def main():
     parser.add_argument('-e', '--epoch', type=int, required=False)
     parser.add_argument('-l', '--max_len', type=int, default=20)
     parser.add_argument('--n_samples', type=int, default=100)
-    parser.add_argument('--n_seq', type=int, default=80 * 1000)
     parser.add_argument('--kmers', required=True)
     parser.add_argument('--checkpoint_dir', required=True)
     parser.add_argument('--input_data_dir', required=True)
@@ -37,7 +37,6 @@ def main():
     max_len = args.max_len
     n_samples = args.n_samples
     class_size = n_samples // 2
-    n_seq = args.n_seq
     kmers = args.kmers.split(',') #["QGD", "IKL", "ENQ", "SPF"] or ["DPM"]
     checkpoint_dir = args.checkpoint_dir
     input_data_dir = args.input_data_dir
@@ -61,13 +60,12 @@ def main():
         start_epoch = warm_start_epoch
     for epoch in range(start_epoch+1, start_epoch+1+n_epochs):
         print(f"===== epoch {epoch+1}/{n_epochs} =====")
-        dataset_seq, dataset_repertoire_id, dataset_tm_target, dataset_kl_target, dataset_repertoire_label = input_data
-        dataset_repertoire_id = np.repeat(np.arange(n_samples), n_seq)
-        reverse_base = n_samples - ((dataset_repertoire_id // class_size) + 1) * class_size
-        random_repertoire_id = np.random.randint(0, class_size, size=dataset_repertoire_id.shape)
-        random_repertoire_id = random_repertoire_id + reverse_base
-        dataset_repertoire_id = np.concatenate([dataset_repertoire_id, np.flip(dataset_repertoire_id)])
-        input_data = dataset_seq, dataset_repertoire_id, dataset_tm_target, dataset_kl_target, dataset_repertoire_label
+        dataset_seq, dataset_repertoire_id, dataset_tm_target, dataset_kl_target, dataset_repertoire_label, sample_labels, sample_sizes = input_data
+        dataset_repertoire_id = np.concatenate([
+            dataset_repertoire_id[:dataset_repertoire_id.shape[0] // 2],
+            generate_random_sample_ids(sample_sizes, sample_labels)
+        ])
+        input_data = dataset_seq, dataset_repertoire_id, dataset_tm_target, dataset_kl_target, dataset_repertoire_label, sample_labels, sample_sizes
         gc.collect()
         airrtm_model.fit_model(batch_size=2048, epochs=1, input_data=input_data, callbacks=[])
         airrtm_model.model.save(Path(checkpoint_dir) / f'model_{witness_rate}_epoch_{epoch}.hdf5')
