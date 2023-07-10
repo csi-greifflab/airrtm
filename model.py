@@ -62,9 +62,10 @@ class AIRRTM:
             AIRRTM.entropy_reg(weight_matrix) * entropy_coef
             # AIRRTM.correlation_reg(weight_matrix) * 0 + \
 
-    @staticmethod
-    def reconstruction_loss(input_seqs, decoded_seqs):
-        reconstruction_loss = tf.reduce_mean(tf.keras.losses.categorical_crossentropy(input_seqs, decoded_seqs))
+    def reconstruction_loss(self, input_seqs, one_hot_decoded_seqs):
+        reconstruction_loss = tf.reduce_mean(
+            tf.keras.losses.sparse_categorical_crossentropy(input_seqs, one_hot_decoded_seqs)
+        )
         return reconstruction_loss
 
     #latent vector sampling
@@ -132,7 +133,14 @@ class AIRRTM:
         self.reconstruction_loss_coef = reconstruction_loss_coef
         self.latent_space_to_topic_proportions_coef = latent_space_to_topic_proportions_coef
 
-        self.seq_input_layer = tf.keras.layers.Input(shape=(self.max_len, self.alphabet_size), name="sequence_input")
+        self.seq_input_layer = tf.keras.layers.Input(shape=(self.max_len, 1), name="sequence_input")
+        self.seq_one_hot_encoding_layer = tf.keras.layers.TimeDistributed(
+            tf.keras.layers.CategoryEncoding(
+                num_tokens=self.alphabet_size,
+                output_mode='one_hot',
+            ),
+            name='seq_one_hot_encoder',
+        )
         self.sample_input_layer = tf.keras.layers.Input(shape=(1,), name="repertoire_input")
 
         self.sample_topic_proportions_layer = tf.keras.layers.Embedding(
@@ -147,11 +155,14 @@ class AIRRTM:
             name="topic_proportions"
         )
         self.topic_proportions_reshape_layer = tf.keras.layers.Reshape(target_shape=(self.n_topics,))
-        self.encode_layer = tf.keras.models.Sequential([
-           tf.keras.layers.Conv1D(filters=self.n_topics, kernel_size=max_len//2, name="EncoderConv_1"),
-           tf.keras.layers.PReLU(),
-           tf.keras.layers.GlobalMaxPool1D(name="EncoderMaxPool_global"),
-        ]) 
+        self.encode_layer = tf.keras.models.Sequential(
+            [
+                tf.keras.layers.Conv1D(filters=self.n_topics, kernel_size=max_len//2),
+                tf.keras.layers.PReLU(),
+                tf.keras.layers.GlobalMaxPool1D(name="EncoderMaxPool_global"),
+            ],
+            name='encoder_conv',
+        ) 
         self.encode_layer_2 = tf.keras.layers.LSTM(units=self.latent_dim, return_sequences=False, return_state=False, name="encoderLSTM")
         self.concat_layer = tf.keras.layers.Concatenate()
         self.sampling_layer = AIRRTM.SamplingLayer(self.latent_dim)
@@ -190,8 +201,9 @@ class AIRRTM:
         topic_proportions = tf.keras.activations.softmax(topic_proportions)
         topic_proportions = self.topic_proportions_reshape_layer(topic_proportions)
 
-        encoded_seq_1 = self.encode_layer(self.seq_input_layer)
-        encoded_seq_2 = self.encode_layer_2(self.seq_input_layer)
+        one_hot_seq = self.seq_one_hot_encoding_layer(self.seq_input_layer)
+        encoded_seq_1 = self.encode_layer(one_hot_seq)
+        encoded_seq_2 = self.encode_layer_2(one_hot_seq)
         encoded_seq = self.concat_layer([encoded_seq_1, encoded_seq_2])
         z_mean = self.pre_z_mean_layer_act(encoded_seq)
         z_mean = self.z_mean_layer(z_mean)
@@ -210,7 +222,6 @@ class AIRRTM:
         decoded_sequence = self.decode_dense_layer(decoded_sequence)
         self.decoded_sequence_output = self.decode_softmax_layer(decoded_sequence)
         
-
 
         self.model = tf.keras.Model(
             inputs=[
@@ -233,7 +244,7 @@ class AIRRTM:
             loss={
                 "tm_likelihood": lambda x, y: bc_loss(x,y) * self.tm_likelihood_coef,
                 "label_likelihood": lambda x, y: bc_loss(x,y) * self.label_likelihood_coef,
-                "decoded_sequence": lambda x, y: AIRRTM.reconstruction_loss(x, y) * self.reconstruction_loss_coef,
+                "decoded_sequence": lambda x, y: self.reconstruction_loss(x, y) * self.reconstruction_loss_coef,
                 "kl_divergence": lambda x, y: (x+y) * self.kl_coef,
                 # "correlation_reg": lambda x, y: y * self.decorrelation_regularizer_coef,
             },
@@ -274,7 +285,8 @@ class AIRRTM:
         self.model = tf_model
         self.sample_topic_proportions_layer = [l for l in tf_model.layers if l.name == 'topic_proportions'][0]
         self.latent_space_to_topic_proportions_layer = [l for l in tf_model.layers if l.name == 'latent_to_topics'][0]
-        self.encode_layer = [l for l in tf_model.layers if isinstance(l, tf.keras.models.Sequential)][0]
+        self.seq_one_hot_encoding_layer = [l for l in tf_model.layers if l.name == 'seq_one_hot_encoder'][0]
+        self.encode_layer_1 = [l for l in tf_model.layers if l.name == 'encoder_conv'][0]
         self.encode_layer_2 = [l for l in tf_model.layers if l.name == 'encoderLSTM'][0]
         self.z_mean_layer = [l for l in tf_model.layers if l.name == 'MeanVector'][0]
         self.pre_z_mean_layer_act = [l for l in tf_model.layers if isinstance(l, tf.keras.layers.PReLU)][0] 
@@ -285,8 +297,9 @@ class AIRRTM:
         ][0]
 
     def encode_sequences(self, seqs):
-        encoded_seq_1 = self.encode_layer(seqs)
-        encoded_seq_2 = self.encode_layer_2(seqs)
+        one_hot_seqs = self.seq_one_hot_encoding_layer(seqs)
+        encoded_seq_1 = self.encode_layer(one_hot_seqs)
+        encoded_seq_2 = self.encode_layer_2(one_hot_seqs)
         encoded_seq = tf.concat([encoded_seq_1, encoded_seq_2], axis=-1)
         z_mean = self.pre_z_mean_layer_act(encoded_seq)
         z_mean = self.z_mean_layer(z_mean)

@@ -35,7 +35,8 @@ def preprocess_seq_list(seqs, max_len, alphabet):
     label_encoder.fit(alphabet)
     seqs = [seq[:max_len].upper() for seq in seqs]
     array = np.array([label_encoder.transform(list(seq) + [alphabet[0]] * (max_len - len(seq))) for seq in seqs])
-    res = tf.one_hot(array, depth=alphabet_size).numpy()
+    res = array.reshape(-1, max_len, 1)
+    # res = tf.one_hot(array, depth=alphabet_size).numpy()
     return res
 
 
@@ -63,6 +64,7 @@ def create_input_tensors(samples, sample_labels):
     n_samples = len(samples)
     sample_sizes = [sample.shape[0] for sample in samples]
     total_size = sum(sample_sizes)
+    sample_labels = sample_labels[:n_samples]
 
     dataset_repertoire_id = np.concatenate([
         np.full(

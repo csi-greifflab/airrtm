@@ -15,6 +15,7 @@ def main():
     parser.add_argument('--n_samples', type=int, required=True)
     parser.add_argument('--n_seq', type=int, default=None)
     parser.add_argument('--input_data_dir', required=True)
+    parser.add_argument('--translate', action='store_true')
     args = parser.parse_args()
 
     samples, repertoires_aa, sample_labels = load_data(
@@ -24,6 +25,7 @@ def main():
         alphabet=alphabet,
         n_samples=args.n_samples,
         n_seq=args.n_seq,
+        translate=args.translate,
     )
     input_data = create_input_tensors(samples, sample_labels)
 
