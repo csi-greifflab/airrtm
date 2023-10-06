@@ -40,12 +40,28 @@ def preprocess_seq_list(seqs, max_len, alphabet):
     return res
 
 
-def load_data(input_data_dir, witness_rate, max_len, alphabet, n_samples, n_seq=None, translate=True):
+def load_data(
+    input_data_dir, witness_rate, max_len, min_len, alphabet,
+    # n_samples,
+    n_seq=None, translate=True
+):
+    metadata_df = pd.read_csv(f'{input_data_dir}/samples/{witness_rate}/metadata.csv')
+    metadata_df = metadata_df.loc[metadata_df['split'] == 'train'].reset_index(drop=True)
+    n_samples = metadata_df.shape[0]
+    print(f'n_samples={n_samples}')
     repertoires = []
     signal_seqs_ids = []
-    for i in tqdm(range(n_samples)):
-        records = SeqIO.parse(f'{input_data_dir}/samples/{witness_rate}/{i}.fasta', format='fasta')
-        records = [str(s.seq) for s in records]
+    for row_id in tqdm(range(n_samples)):
+        row = metadata_df.iloc[row_id]
+        filename = row['filename']
+        if filename.endswith('.csv'):
+            sep = ','
+        elif filename.endswith('.tsv'):
+            sep = '\t'
+        else:
+            raise ValueError(f'Unknown format {filename}')
+        samples_df = pd.read_csv(f'{input_data_dir}/samples/{witness_rate}/{filename}', sep=sep)
+        records = samples_df['cdr3_aa'].fillna('AAA').to_list()
         if n_seq is not None:
             assert len(records) >= n_seq
             records = records[:n_seq]
@@ -54,9 +70,9 @@ def load_data(input_data_dir, witness_rate, max_len, alphabet, n_samples, n_seq=
         repertoires_aa = [[str(Seq.Seq(s).translate()) for s in r] for r in tqdm(repertoires)]
     else:
         repertoires_aa = [[s for s in r] for r in repertoires]
+    repertoires_aa = [[s for s in r if len(s) >= min_len] for r in repertoires_aa]
     samples = [preprocess_seq_list(r, alphabet=alphabet, max_len=max_len) for r in tqdm(repertoires_aa)]
-    sample_labels_df = pd.read_csv(f'{input_data_dir}/samples/{witness_rate}/metadata.csv')
-    sample_labels = sample_labels_df['label'].to_list()
+    sample_labels = metadata_df['label'].to_list()
     return samples, repertoires_aa, sample_labels
 
 
@@ -64,7 +80,7 @@ def create_input_tensors(samples, sample_labels):
     n_samples = len(samples)
     sample_sizes = [sample.shape[0] for sample in samples]
     total_size = sum(sample_sizes)
-    sample_labels = sample_labels[:n_samples]
+    sample_labels = sample_labels
 
     dataset_repertoire_id = np.concatenate([
         np.full(
@@ -77,6 +93,18 @@ def create_input_tensors(samples, sample_labels):
     dataset_repertoire_label = np.concatenate([
         np.full(
             fill_value=sample_label,
+            shape=sample_size
+        ) for sample_size, sample_label in zip(sample_sizes, sample_labels)
+    ])
+
+    neg_class_weight = np.mean(sample_labels)
+    pos_class_weight = 1 - neg_class_weight
+    normalizer = 2 * neg_class_weight * pos_class_weight
+    neg_class_weight /=  normalizer
+    pos_class_weight /=  normalizer
+    sample_weights = np.concatenate([
+        np.full(
+            fill_value=1 / sample_size * (pos_class_weight if sample_label else neg_class_weight),
             shape=sample_size
         ) for sample_size, sample_label in zip(sample_sizes, sample_labels)
     ])
@@ -94,10 +122,15 @@ def create_input_tensors(samples, sample_labels):
     dataset_kl_target_2 = np.zeros_like(dataset_tm_target_2)
     dataset_repertoire_label_2 = np.concatenate([
         dataset_repertoire_label, 
+        # dataset_repertoire_label # repertoire_id comes from the opposite class
         1 - dataset_repertoire_label # repertoire_id comes from the opposite class
     ])
-    print(dataset_seq_2.shape, dataset_repertoire_id_2.shape, dataset_tm_target_2.shape, dataset_kl_target_2.shape, dataset_repertoire_label_2.shape)
-    return dataset_seq_2, dataset_repertoire_id_2, dataset_tm_target_2, dataset_kl_target_2, dataset_repertoire_label_2, sample_labels, sample_sizes
+    sample_weights_2 = np.concatenate([
+        sample_weights, 
+        sample_weights,
+    ]) *  sample_weights.shape[0] / n_samples
+    print(dataset_seq_2.shape, dataset_repertoire_id_2.shape, dataset_tm_target_2.shape, dataset_kl_target_2.shape, dataset_repertoire_label_2.shape, sample_weights_2.shape, sample_weights_2.sum())
+    return dataset_seq_2, dataset_repertoire_id_2, dataset_tm_target_2, dataset_kl_target_2, dataset_repertoire_label_2, sample_weights_2, sample_labels, sample_sizes
 
 
 def generate_random_sample_ids(sample_sizes, sample_labels):
