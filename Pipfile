@@ -8,7 +8,7 @@ name = "pypi"
 numpy = "*"
 pandas = "*"
 scikit-learn = "*"
-tensorflow = "*"
+tensorflow = {version="*", extras=["and-cuda"]}
 tqdm = "*"
 biopython = "*"
 
