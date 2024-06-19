@@ -3,8 +3,26 @@
 
 This repository contains the code of the AIRRTM model from the article [Weakly supervised identification and generation of adaptive immune receptor sequences associated with immune disease status](https://www.biorxiv.org/content/10.1101/2023.09.24.558823v1). 
 
+## Installation
+
+### Pipenv
+A locked Pipenv environment is provided with the repository.
+To install the package, you need to run 
+```shell
+pipenv shell
+pipenv install
+```
+The only prerequisites are havinng Pipenv and python3.9 installed on your machine.
+
+### requirements.txt
+Alternatively, you can use the `requirements.txt` file to install the dependencies in a *clean python3.9 environemnt*:
+```shell
+python -m pip install -r requirements.txt
+```
+
+
 ## Data
-Two synthetic datasets used in the article can be found in the corresponding [repository](https://github.com/csi-greifflab/airrtm_data). 
+Two synthetic datasets used in the article can be found in the corresponding [repository](https://github.com/csi-greifflab/airrtm_data). Note that you would need to unzip the data file for given dataset and witness rate (for example, [dataset S1, wr=0.0001](https://github.com/csi-greifflab/airrtm_data/blob/main/S1/samples/0.0001/data.zip)) before running training/prediction on them.
 
 The model can be trained on a dataset with the following structure:
 ```

@@ -2,7 +2,7 @@ import numpy as np
 import tensorflow as tf
 
 
-@tf.keras.saving.register_keras_serializable('airrtm')
+@tf.keras.utils.register_keras_serializable('airrtm')
 class ReconstructionLoss(tf.keras.losses.Loss):
     def __init__(self, coef, **kwargs):
         super().__init__(**kwargs)
@@ -15,7 +15,7 @@ class ReconstructionLoss(tf.keras.losses.Loss):
         return reconstruction_loss * self.coef
 
 
-@tf.keras.saving.register_keras_serializable('airrtm')
+@tf.keras.utils.register_keras_serializable('airrtm')
 class BCLossCoef(tf.keras.losses.Loss):
     def __init__(self, coef, **kwargs):
         super().__init__(**kwargs)
@@ -26,7 +26,7 @@ class BCLossCoef(tf.keras.losses.Loss):
         return self.bc_loss(y_true, y_pred, **kwargs) * self.coef
 
 
-@tf.keras.saving.register_keras_serializable('airrtm')
+@tf.keras.utils.register_keras_serializable('airrtm')
 class KLDLossCoef(tf.keras.losses.Loss):
     def __init__(self, coef, **kwargs):
         super().__init__(**kwargs)
@@ -37,7 +37,7 @@ class KLDLossCoef(tf.keras.losses.Loss):
         return self.mae_loss(y_true, y_pred, **kwargs) * self.coef
 
 
-@tf.keras.saving.register_keras_serializable('airrtm')
+@tf.keras.utils.register_keras_serializable('airrtm')
 class BCLossScaled(tf.keras.metrics.BinaryCrossentropy):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -49,7 +49,7 @@ class BCLossScaled(tf.keras.metrics.BinaryCrossentropy):
         return (super().result() + np.log(0.5)) * 1e3
 
 
-@tf.keras.saving.register_keras_serializable('airrtm')
+@tf.keras.utils.register_keras_serializable('airrtm')
 class KLDMetric(tf.keras.metrics.MeanAbsoluteError):
     def __init__(self, coef, **kwargs):
         super().__init__(**kwargs)

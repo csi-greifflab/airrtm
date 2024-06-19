@@ -11,46 +11,14 @@ import tensorflow as tf
 from sklearn.preprocessing import LabelEncoder
 from tqdm import tqdm
 
-from utils import alphabet_size
+from utils import alphabet_size, alphabet
 from losses import ReconstructionLoss, BCLossCoef, KLDLossCoef, BCLossScaled, KLDMetric
+from transformer import TransformerEncoder
 
 
 
-
-@tf.keras.saving.register_keras_serializable('airrtm')
-class AIRRTM(tf.keras.Model):
-    # @staticmethod
-    # def correlation_reg(weight_matrix, n_items=None, transpose=False):
-    #     if transpose:
-    #         weight_matrix = tf.transpose(weight_matrix)
-    #     if n_items is None:
-    #         n_items = weight_matrix.shape[0]
-    #     corr_matrix_sq = tfp.stats.correlation(
-    #         weight_matrix,
-    #         weight_matrix,
-    #     ) ** 2
-    #     total_correlation = tf.reduce_sum(corr_matrix_sq) - n_items
-    #     mean_correlation = total_correlation / (n_items * (n_items - 1))
-    #     return mean_correlation
-
-    # @staticmethod
-    # def entropy_reg(weight_matrix, n_items=None, transpose=False):
-    #     if len(weight_matrix.shape) != 2:
-    #         raise Exception
-    #     if transpose:
-    #         weight_matrix = tf.transpose(weight_matrix)
-    #     if n_items is None:
-    #         n_items = weight_matrix.shape[1]
-    #     probs_matrix = tf.keras.activations.softmax(weight_matrix, axis=0)
-    #     entropy = tf.reduce_sum(- probs_matrix * tf.math.log(probs_matrix)) / n_items
-    #     return entropy
-
-
-    # def topic_proportions_reg(weight_matrix, entropy_coef, correlation_coef, l2_coef):
-    #     return 0 + \
-    #         tf.reduce_mean(weight_matrix**2)**0.5 * l2_coef + \
-    #         AIRRTM.entropy_reg(weight_matrix) * entropy_coef
-    #         # AIRRTM.correlation_reg(weight_matrix) * 0 + \    
+@tf.keras.utils.register_keras_serializable('airrtm')
+class AIRRTM(tf.keras.Model):  
 
     #latent vector sampling
     @staticmethod
@@ -102,6 +70,11 @@ class AIRRTM(tf.keras.Model):
         label_likelihood_coef=1.0,
         reconstruction_loss_coef=4e2,
         latent_space_to_topic_proportions_coef=1.0,
+        v_size=0,
+        v_embedding_size=4,
+        j_size=0,
+        j_embedding_size=2,
+        additional_encoder='transformer',
     ):
         super().__init__()
         self.optimizer = None
@@ -122,6 +95,12 @@ class AIRRTM(tf.keras.Model):
         self.label_likelihood_coef = label_likelihood_coef
         self.reconstruction_loss_coef = reconstruction_loss_coef
         self.latent_space_to_topic_proportions_coef = latent_space_to_topic_proportions_coef
+        self.v_size = v_size
+        self.v_embedding_size = v_embedding_size
+        self.j_size = j_size
+        self.j_embedding_size = j_embedding_size
+        self.use_vj = self.v_size > 0 and self.j_size > 0
+        self.additional_encoder = additional_encoder
 
         self.seq_input_layer = tf.keras.layers.Input(shape=(self.max_len, 1), name="sequence_input")
         self.seq_one_hot_encoding_layer = tf.keras.layers.TimeDistributed(
@@ -131,34 +110,68 @@ class AIRRTM(tf.keras.Model):
             ),
             name='seq_one_hot_encoder',
         )
+        
+        if self.use_vj:
+            self.vj_gene_input_layer = tf.keras.layers.Input(shape=(2,), name="vj_gene_input")
+            self.v_gene_embedding_layer =  tf.keras.layers.CategoryEncoding(
+                num_tokens=self.v_size,  # input_dim=self.v_size,
+                output_mode='one_hot', #output_dim=self.v_embedding_size,
+                name="v_gene_oh"
+            )
+            self.j_gene_embedding_layer =  tf.keras.layers.CategoryEncoding(
+                num_tokens=self.j_size,  # input_dim=self.j_size,
+                output_mode='one_hot',  # output_dim=self.j_embedding_size,
+                name="j_gene_oh"
+            )
         self.sample_input_layer = tf.keras.layers.Input(shape=(1,), name="repertoire_input")
 
         self.sample_topic_proportions_layer = tf.keras.layers.Embedding(
             input_dim=self.n_samples,
             output_dim=self.n_topics,
-            # embeddings_regularizer=lambda M: AIRRTM.topic_proportions_reg(
-            #     M,
-            #     self.entropy_regularizer_coef,
-            #     0,
-            #     self.topic_proportions_l2_coef
-            # ),
             name="topic_proportions"
         )
         self.topic_proportions_reshape_layer = tf.keras.layers.Reshape(target_shape=(self.n_topics,))
-        # self.encode_layer = tf.keras.models.Sequential(
-        #     [
-        #         tf.keras.layers.Conv1D(filters=self.n_topics, kernel_size=max_len//2),
-        #         tf.keras.layers.PReLU(),
-        #         tf.keras.layers.GlobalMaxPool1D(name="EncoderMaxPool_global"),
-        #     ],
-        #     name='encoder_conv',
-        # )
-        self.encode_layer = tf.keras.layers.Bidirectional(
-            tf.keras.layers.LSTM(
-                units=self.n_topics, return_sequences=False, return_state=False
-            ),
-            name="encoder_1"
-        )
+        if self.additional_encoder == 'lstm':
+            self.encode_layer = tf.keras.layers.Bidirectional(
+                tf.keras.layers.LSTM(
+                    units=self.n_topics, return_sequences=False, return_state=False
+                ),
+                name="encoder_1"
+            )
+        
+        elif self.additional_encoder == 'convolutional':
+            self.encode_layer = tf.keras.models.Sequential(
+                [
+                    tf.keras.layers.Conv1D(filters=self.n_topics, kernel_size=max_len//2),
+                    tf.keras.layers.PReLU(),
+                    tf.keras.layers.GlobalMaxPool1D(),
+                ],
+                name='encoder_1',
+            )
+        elif self.additional_encoder == 'transformer':
+            self.encode_layer = tf.keras.models.Sequential(
+                [
+                    TransformerEncoder(
+                        intermediate_dim=self.latent_dim,
+                        num_heads=self.n_topics,
+                    ),
+                    tf.keras.layers.PReLU(),
+                    TransformerEncoder(
+                        intermediate_dim=self.latent_dim,
+                        num_heads=self.n_topics,
+                    ),
+                    tf.keras.layers.PReLU(),
+                    TransformerEncoder(
+                        intermediate_dim=self.latent_dim,
+                        num_heads=self.n_topics,
+                    ),
+                    tf.keras.layers.PReLU(),
+                    tf.keras.layers.GlobalMaxPool1D(),
+                ],
+                name='encoder_1',
+            )
+        else:
+            raise ValueError(f'Unsupported additional encoder layer type {self.additional_encoder}')
         self.encode_layer_2 = tf.keras.layers.Bidirectional(
             tf.keras.layers.LSTM(
                 units=self.latent_dim, return_sequences=False, return_state=False
@@ -167,6 +180,7 @@ class AIRRTM(tf.keras.Model):
         )
         # self.encode_layer_2 = tf.keras.layers.LSTM(units=self.latent_dim, return_sequences=False, return_state=False, name="encoderLSTM")
         self.concat_layer = tf.keras.layers.Concatenate()
+        self.concat_layer_2 = tf.keras.layers.Concatenate()
         self.sampling_layer = AIRRTM.SamplingLayer(self.latent_dim)
         self.pre_z_mean_layer_act = tf.keras.layers.PReLU()
         self.z_mean_layer = tf.keras.layers.Dense(
@@ -214,23 +228,38 @@ class AIRRTM(tf.keras.Model):
         )
         encoded_seq_1 = self.encode_layer(one_hot_seq)
         encoded_seq_2 = self.encode_layer_2(one_hot_seq)
+
+        if self.use_vj:
+            v_gene_embegging = self.v_gene_embedding_layer(
+                inputs['vj_gene_input'][:, 0]
+            )
+            j_gene_embegging = self.j_gene_embedding_layer(
+                inputs['vj_gene_input'][:, 1]
+            )
+        
         encoded_seq = self.concat_layer([encoded_seq_1, encoded_seq_2])
+
         z_mean = self.pre_z_mean_layer_act(encoded_seq)
         z_mean = self.z_mean_layer(z_mean)
         z, z_log_sigma = self.sampling_layer(z_mean)
 
-        seq_topic_probabilities = self.latent_space_to_topic_proportions_layer(z)
+        if self.use_vj:
+            z_vj = self.concat_layer_2([z, v_gene_embegging, j_gene_embegging])
+            seq_topic_probabilities = self.latent_space_to_topic_proportions_layer(z_vj)
+        else:
+            seq_topic_probabilities = self.latent_space_to_topic_proportions_layer(z)
 
-        # seq_total_probability_output = self.dot_product_layer([topic_proportions, seq_topic_probabilities])
-        seq_total_probability_signal = tf.keras.activations.sigmoid(self.dot_product_layer([
-            topic_proportions[:, :self.n_topics_signal],
-            seq_topic_probabilities[:, :self.n_topics_signal],
-        ]))
-        seq_total_probability_nonsignal = tf.keras.activations.sigmoid(self.dot_product_layer([
-            topic_proportions[:, self.n_topics_signal:],
-            seq_topic_probabilities[:, self.n_topics_signal:],
-        ]))
-        seq_total_probability_output = self.tm_signal_coef * seq_total_probability_signal + (1 - self.tm_signal_coef) * seq_total_probability_nonsignal
+        seq_total_probability_output = self.dot_product_layer([topic_proportions, seq_topic_probabilities])
+        # seq_total_probability_signal = tf.keras.activations.sigmoid(self.dot_product_layer([
+        #     topic_proportions[:, :self.n_topics_signal],
+        #     seq_topic_probabilities[:, :self.n_topics_signal],
+        # ]))
+        # seq_total_probability_nonsignal = tf.keras.activations.sigmoid(self.dot_product_layer([
+        #     topic_proportions[:, self.n_topics_signal:],
+        #     seq_topic_probabilities[:, self.n_topics_signal:],
+        # ]))
+        # seq_total_probability_output = self.tm_signal_coef * seq_total_probability_signal + (1 - self.tm_signal_coef) * seq_total_probability_nonsignal
+        
         label_output = self.label_prediction_layer(topic_proportions[:, :self.n_topics_signal]) # seq_topic_probabilities
         # label_output = self.label_prediction_layer(seq_topic_probabilities[:, :self.n_topics_signal]) # seq_topic_probabilities
 
@@ -286,12 +315,22 @@ class AIRRTM(tf.keras.Model):
         )
 
     def fit_model(self, batch_size, epochs, input_data, callbacks=[]):
-        dataset_seq, dataset_repertoire_id, dataset_tm_target, dataset_kl_target, dataset_repertoire_label, sample_weights, sample_labels, sample_sizes = input_data
-        self.fit(
-            x={
+        if self.use_vj:
+            dataset_seq, vj_info, dataset_repertoire_id, dataset_tm_target, dataset_kl_target, dataset_repertoire_label, sample_weights, sample_labels, sample_sizes = input_data
+            dataset_vj, v_size, j_size = vj_info
+            inputs = {
+                "sequence_input": dataset_seq,
+                "vj_gene_input": dataset_vj,
+                "repertoire_input": dataset_repertoire_id
+            }
+        else:
+            dataset_seq, dataset_repertoire_id, dataset_tm_target, dataset_kl_target, dataset_repertoire_label, sample_weights, sample_labels, sample_sizes = input_data
+            inputs = {
                 "sequence_input": dataset_seq,
                 "repertoire_input": dataset_repertoire_id
-            },
+            }
+        self.fit(
+            x=inputs,
             y={
                 "tm_likelihood": dataset_tm_target,
                 "label_likelihood": dataset_repertoire_label,
@@ -308,10 +347,13 @@ class AIRRTM(tf.keras.Model):
     def get_topic_proportion_matrix(self):
         return self.sample_topic_proportions_layer.get_weights()[0]
 
-    def encode_sequences(self, seqs):
+    def encode_sequences(self, seqs, vj=None):
+        seqs =  tf.convert_to_tensor(seqs, dtype=np.int32)
         one_hot_seqs = self.seq_one_hot_encoding_layer(seqs)
+        # one_hot_seqs = tf.squeeze(one_hot_seqs, 2)  # TODO: check this shape
         encoded_seq_1 = self.encode_layer(one_hot_seqs)
         encoded_seq_2 = self.encode_layer_2(one_hot_seqs)
+
         encoded_seq = tf.concat([encoded_seq_1, encoded_seq_2], axis=-1)
         z_mean = self.pre_z_mean_layer_act(encoded_seq)
         z_mean = self.z_mean_layer(z_mean)
@@ -323,19 +365,26 @@ class AIRRTM(tf.keras.Model):
         decoded_sequence = self.decode_dense_layer(decoded_sequence)
         return decoded_sequence
 
-    def predict_topic_probs(self, seqs):
+    def predict_topic_probs(self, seqs, vj=None):
+        encoded_seq = self.encode_sequences(seqs, vj)
+        if self.use_vj:
+            assert vj is not None
+            v_gene_embegging = self.v_gene_embedding_layer(vj[:, 0])
+            j_gene_embegging = self.j_gene_embedding_layer(vj[:, 1])
+            encoded_seq = self.concat_layer_2([encoded_seq, v_gene_embegging, j_gene_embegging])
         return self.latent_space_to_topic_proportions_layer(
-            self.encode_sequences(seqs)
+            encoded_seq
         ).numpy()
 
-    def predict_signal_intensity(self, seqs):
+    def predict_signal_intensity(self, seqs, vj=None):
         sample_topic_p = tf.keras.activations.softmax(self.sample_topic_proportions_layer.weights[0]).numpy()
         sample_topic_p_df = pd.DataFrame(sample_topic_p[:, :self.n_topics_signal])
         topic_diffs = sample_topic_p_df.loc[self.sample_labels == 1].mean(axis=0) - sample_topic_p_df.iloc[self.sample_labels == 0].mean(axis=0)
         best_topic_id = topic_diffs.argmax()
         topic_diffs_weights = topic_diffs.abs() / topic_diffs.abs().sum() * topic_diffs / topic_diffs.abs()
-        predicted_topics = self.predict_topic_probs(seqs)[:, :self.n_topics_signal]
+        predicted_topics = self.predict_topic_probs(seqs, vj)[:, :self.n_topics_signal]
         signal_intensity = (predicted_topics  * topic_diffs_weights.to_numpy()).sum(axis=1)
+        # signal_intensity = self.label_prediction_layer(predicted_topics).numpy().flatten()
         return signal_intensity
 
     def predict_signal_intensity_2(self, seqs):
@@ -351,25 +400,24 @@ def seq_tensor_to_seq(seq_tensor):
     return sequences
 
 
-def get_default_model(max_len, sample_labels):
+def get_default_model(max_len, sample_labels, v_size=0, j_size=0, additional_encoder='convolutional'):
     n_samples = len(sample_labels)
 
-    tm_coef = 0.5  # tm_coef = 0.995
+    tm_coef = 0.995  # tm_coef = 0.995
     vae_coef = 1 - tm_coef
 
-    tm_likelihood_coef=0.7
+    tm_likelihood_coef=0.99
     label_likelihood_coef=(1.0 - tm_likelihood_coef)
 
-    reconstruction_loss_coef=0.75  # reconstruction_loss_coef=0.95
+    reconstruction_loss_coef=0.95  # reconstruction_loss_coef=0.95
     kl_coef=(1.0 - reconstruction_loss_coef)
 
     decorrelation_regularizer_coef = 0.01
     latent_space_to_topic_proportions_coef = 0.001
 
-    n_topics_signal = 3  # n_topics_signal = 4
+    n_topics_signal = 4  # n_topics_signal = 4
     n_topics_nonsignal = 4  # n_topics_nonsignal = 4
-    tm_signal_coef = 0.4
-    n_topics = n_topics_signal + n_topics_nonsignal
+    tm_signal_coef = 0.9
     latent_dim = 70
     airrtm_model = AIRRTM(
         sample_labels=sample_labels,
@@ -387,12 +435,15 @@ def get_default_model(max_len, sample_labels):
         reconstruction_loss_coef=vae_coef * reconstruction_loss_coef,
         kl_coef=vae_coef * kl_coef / latent_dim,
         latent_space_to_topic_proportions_coef=latent_space_to_topic_proportions_coef,
+        v_size=v_size,
+        j_size=j_size,
+        additional_encoder=additional_encoder,
     )
-    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
-        initial_learning_rate=1e-3,
-        decay_steps=50000,
-        decay_rate=0.5
-    )
+    lr_schedule = 1e-3 #tf.keras.optimizers.schedules.ExponentialDecay(
+    #     initial_learning_rate=1e-3,
+    #     decay_steps=50000,
+    #     decay_rate=0.5
+    # )
     airrtm_model.compile_model(lr=lr_schedule)
     return airrtm_model
 

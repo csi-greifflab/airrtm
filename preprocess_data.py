@@ -17,9 +17,10 @@ def main():
     parser.add_argument('--n_seq', type=int, default=None)
     parser.add_argument('--input_data_dir', required=True)
     parser.add_argument('--translate', action='store_true')
+    parser.add_argument('--use_vj', action='store_true')
     args = parser.parse_args()
 
-    samples, repertoires_aa, sample_labels = load_data(
+    loaded_data = load_data(
         witness_rate=args.witness_rate,
         input_data_dir=args.input_data_dir,
         max_len=args.max_len,
@@ -28,8 +29,14 @@ def main():
         # n_samples=args.n_samples,
         n_seq=args.n_seq,
         translate=args.translate,
+        use_vj=args.use_vj,
     )
-    input_data = create_input_tensors(samples, sample_labels)
+    if args.use_vj:
+        samples, repertoires_aa, sample_labels, sample_vj_genes, v_size, j_size = loaded_data
+        input_data = create_input_tensors(samples, sample_labels, sample_vj_genes, v_size, j_size)
+    else:
+        samples, repertoires_aa, sample_labels = loaded_data
+        input_data = create_input_tensors(samples, sample_labels)
 
     repertoires_dir = Path(f'{args.input_data_dir}/repertoires_aa/{args.witness_rate}.pickle')
     repertoires_dir.parent.mkdir(parents=True, exist_ok=True)
