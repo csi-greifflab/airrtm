@@ -69,6 +69,7 @@ def main():
     else:
         files = [input_file]
     for f in files:
+        samples_df = None
         if f.suffix == '.fasta':
             records = SeqIO.parse(f, format='fasta')
             records = [str(s.seq) for s in records]
@@ -100,10 +101,12 @@ def main():
         topic_probs = airrtm_model.predict_topic_probs(dataset_seq, dataset_vj)
         signal_intensity = airrtm_model.predict_signal_intensity(dataset_seq, dataset_vj)
 
-        signal_intensity_df = pd.DataFrame({
-            'cdr3_aa': records_aa,
-            'signal_intensity': signal_intensity,
-        })
+        if samples_df is not None:
+            signal_intensity_df = samples_df
+        else:
+            signal_intensity_df = pd.DataFrame()
+        signal_intensity_df['cdr3_aa'] = records_aa
+        signal_intensity_df['signal_intensity'] = signal_intensity
         for topic_id in range(topic_probs.shape[1]):
             signal_intensity_df[f'topic_{topic_id}_prob'] = topic_probs[:, topic_id]
         signal_intensity_df = signal_intensity_df.sort_values(by='signal_intensity', ascending=False)
