@@ -54,6 +54,20 @@ CARVVLLWFGELFDYGMDVW
 CARDLIRGTLL*LL
 ```
 
+Additionally, optional columns `v_gene`, `j_gene` (to use with the `--use_vj` option), and `weight` (is used automatically when present) may be provided. 
+```
+cdr3_aa,v_gene,j_gene,weight
+CATSRDVNTGELFF,TCRBV15-01,TCRBJ02-02,1
+CASSPPGANVLTF,TCRBV11-02,TCRBJ02-06,1
+CASSEYEQYF,TCRBV06-01,TCRBJ02-07,1
+CASSLHEQYF,TCRBV11-02,TCRBJ02-07,9
+CASSAATGATEAFF,TCRBV05-04,TCRBJ01-01,2
+CASSPTGGHTEAFF,TCRBV05-04,TCRBJ01-01,2
+CASSPQGAYNEQFF,TCRBV05-04,TCRBJ02-01,2
+CASWGVNRGDAGYTF,TCRBV25-01,TCRBJ01-02,5042
+CASSAQQGYSGNTIYF,TCRBV28-01,TCRBJ01-03,2247
+```
+
 The metadata file must contain columns `label` (i.e., repertoire label), `filename` and `split` (train/test). 
 ```
 $ head S1/samples/0.005/metadata.csv
@@ -68,20 +82,20 @@ label,filename,split
 
 To train the model, one must first run `preprocess_data.py` on your dataset folder (structured as described above)
 ```
-python preprocess_data.py --input_data_dir INPUT_DATA_DIR -w WITNESS_RATE
+python preprocess_data.py --input_data_dir INPUT_DATA_DIR -w WITNESS_RATE [--use_vj]
 ```
 
 Then you can train the model by running
 ```
-python train_model.py --input_data_dir INPUT_DATA_DIR -w WITNESS_RATE [-t THREADS] --checkpoint_dir CHECKPOINT_DIR
+python train_model.py --input_data_dir INPUT_DATA_DIR -w WITNESS_RATE [-t THREADS] [--use_vj] --checkpoint_dir CHECKPOINT_DIR
 ```
 
 And, with a trained model, make signal intensity predictions on sequences from an unseen repertoire, for example:
 ```
-predict.py -i INPUT_FILE -o OUTPUT_FILE -m CHECKPOINT_DIR/model_0.005_epoch_9.keras
+predict.py -i INPUT_FILE -o OUTPUT_FILE -m CHECKPOINT_DIR/model_0.005_epoch_9.keras [--use_vj]
 ```
 The input csv file must be in the same format as the training files (i.e., it must have a column `cdr3_aa` with amino acid sequences).
-
+Note that the `--use_vj` option must be used consistently, i.e., either by all three commands (`preprocess_data`, `train_model`, `predict`), or by none of them.
 
 
 
