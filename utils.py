@@ -62,6 +62,7 @@ def load_data(
     n_samples = metadata_df.shape[0]
     print(f'n_samples={n_samples}')
     repertoires = []
+    weights = []
     if use_vj:
         with open(f'{input_data_dir}/samples/{witness_rate}/metadata_vj_gene_list.json') as inp:
             vj_dict = json.load(inp)
@@ -83,6 +84,11 @@ def load_data(
             samples_df = samples_df.iloc[:n_seq]
         records = samples_df['cdr3_aa'].fillna('AAA').to_list()
         repertoires.append(records)
+        if 'weight' in samples_df:
+            sample_weights = samples_df['weight']
+        else:
+            sample_weights = np.full(fill_value=1.0, shape=samples_df.shape[0])
+        weights.append(sample_weights)
         if use_vj:
             repertoire_vj_genes.append({'v': samples_df['v_gene'], 'j': samples_df['j_gene']})
 
@@ -97,13 +103,14 @@ def load_data(
         sample_vj_genes = [preprocess_vg_gene_list(vj_lists, vj_dict=vj_dict) for vj_lists in tqdm(repertoire_vj_genes)]
         v_size = len(vj_dict['v'])
         j_size = len(vj_dict['j'])
-        return samples, repertoires_aa, sample_labels, sample_vj_genes, v_size, j_size
-    return samples, repertoires_aa, sample_labels
+        return samples, repertoires_aa, sample_labels, weights, sample_vj_genes, v_size, j_size
+    return samples, repertoires_aa, sample_labels, weights
 
 
 def create_input_tensors(
         samples: list[np.array],
         sample_labels: list[int],
+        sample_weights: list[np.array] = None,
         sample_vj_genes: list[np.array] = None,
         v_size: int = 0,
         j_size: int = 0
@@ -129,16 +136,24 @@ def create_input_tensors(
         ) for sample_size, sample_label in zip(sample_sizes, sample_labels)
     ])
 
+    if sample_weights is not None:
+        assert all([(w >= 0).all() for w in sample_weights])
+        sample_weights = [w / w.sum() for w in sample_weights]
+    else:
+        sample_weights = [
+            np.full(
+                fill_value=1 / sample_size,
+                shape=sample_size
+            ) for sample_size in sample_sizes
+        ]
+
     neg_class_weight = np.mean(sample_labels)
     pos_class_weight = 1 - neg_class_weight
     normalizer = 2 * neg_class_weight * pos_class_weight
     neg_class_weight /=  normalizer
     pos_class_weight /=  normalizer
-    sample_weights = np.concatenate([
-        np.full(
-            fill_value=1 / sample_size * (pos_class_weight if sample_label else neg_class_weight),
-            shape=sample_size
-        ) for sample_size, sample_label in zip(sample_sizes, sample_labels)
+    weights = np.concatenate([
+        w * (pos_class_weight if sample_label else neg_class_weight) for w, sample_label in zip(sample_weights, sample_labels)
     ])
 
     # adding negative examples
@@ -159,15 +174,15 @@ def create_input_tensors(
         # dataset_repertoire_label # repertoire_id comes from the opposite class
         1 - dataset_repertoire_label # repertoire_id comes from the opposite class
     ])
-    sample_weights_2 = np.concatenate([
-        sample_weights, 
-        sample_weights,
-    ]) *  sample_weights.shape[0] / n_samples
+    weights_2 = np.concatenate([
+        weights, 
+        weights,
+    ]) * weights.shape[0] / n_samples 
     if use_vj:
-        print(dataset_seq_2.shape, dataset_vj_2.shape, dataset_repertoire_id_2.shape, dataset_tm_target_2.shape, dataset_kl_target_2.shape, dataset_repertoire_label_2.shape, sample_weights_2.shape, sample_weights_2.sum())
-        return dataset_seq_2, (dataset_vj_2, v_size, j_size), dataset_repertoire_id_2, dataset_tm_target_2, dataset_kl_target_2, dataset_repertoire_label_2, sample_weights_2, sample_labels, sample_sizes    
-    print(dataset_seq_2.shape, dataset_repertoire_id_2.shape, dataset_tm_target_2.shape, dataset_kl_target_2.shape, dataset_repertoire_label_2.shape, sample_weights_2.shape, sample_weights_2.sum())
-    return dataset_seq_2, dataset_repertoire_id_2, dataset_tm_target_2, dataset_kl_target_2, dataset_repertoire_label_2, sample_weights_2, sample_labels, sample_sizes
+        print(dataset_seq_2.shape, dataset_vj_2.shape, dataset_repertoire_id_2.shape, dataset_tm_target_2.shape, dataset_kl_target_2.shape, dataset_repertoire_label_2.shape, weights_2.shape, weights_2.sum())
+        return dataset_seq_2, (dataset_vj_2, v_size, j_size), dataset_repertoire_id_2, dataset_tm_target_2, dataset_kl_target_2, dataset_repertoire_label_2, weights_2, sample_labels, sample_sizes    
+    print(dataset_seq_2.shape, dataset_repertoire_id_2.shape, dataset_tm_target_2.shape, dataset_kl_target_2.shape, dataset_repertoire_label_2.shape, weights_2.shape, weights_2.sum())
+    return dataset_seq_2, dataset_repertoire_id_2, dataset_tm_target_2, dataset_kl_target_2, dataset_repertoire_label_2, weights_2, sample_labels, sample_sizes
 
 
 def generate_random_sample_ids(sample_sizes, sample_labels):

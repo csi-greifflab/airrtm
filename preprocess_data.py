@@ -32,11 +32,11 @@ def main():
         use_vj=args.use_vj,
     )
     if args.use_vj:
-        samples, repertoires_aa, sample_labels, sample_vj_genes, v_size, j_size = loaded_data
-        input_data = create_input_tensors(samples, sample_labels, sample_vj_genes, v_size, j_size)
+        samples, repertoires_aa, sample_labels, sample_weights, sample_vj_genes, v_size, j_size = loaded_data
+        input_data = create_input_tensors(samples, sample_labels, sample_weights, sample_vj_genes, v_size, j_size)
     else:
-        samples, repertoires_aa, sample_labels = loaded_data
-        input_data = create_input_tensors(samples, sample_labels)
+        samples, repertoires_aa, sample_labels, sample_weights = loaded_data
+        input_data = create_input_tensors(samples, sample_labels, sample_weights)
 
     repertoires_dir = Path(f'{args.input_data_dir}/repertoires_aa/{args.witness_rate}.pickle')
     repertoires_dir.parent.mkdir(parents=True, exist_ok=True)
