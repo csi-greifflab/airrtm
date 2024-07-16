@@ -85,7 +85,7 @@ def load_data(
         records = samples_df['cdr3_aa'].fillna('AAA').to_list()
         repertoires.append(records)
         if 'weight' in samples_df:
-            sample_weights = samples_df['weight']
+            sample_weights = samples_df['weight'].to_numpy()
         else:
             sample_weights = np.full(fill_value=1.0, shape=samples_df.shape[0])
         weights.append(sample_weights)
@@ -96,7 +96,9 @@ def load_data(
         repertoires_aa = [[str(Seq.Seq(s).translate()) for s in r] for r in tqdm(repertoires)]
     else:
         repertoires_aa = [[s for s in r] for r in repertoires]
-    repertoires_aa = [[s for s in r if len(s) >= min_len] for r in repertoires_aa]
+    min_length_masks = [[i for i, s in enumerate(r) if len(s) >= min_len] for r in repertoires_aa]
+    repertoires_aa = [[r[i] for i in m] for r, m in zip(repertoires_aa, min_length_masks)]
+    weights = [w[m] for w, m in zip(weights, min_length_masks)]
     samples = [preprocess_seq_list(r, alphabet=alphabet, max_len=max_len) for r in tqdm(repertoires_aa)]
     sample_labels = metadata_df['label'].to_list()
     if use_vj:
