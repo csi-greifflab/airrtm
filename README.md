@@ -98,4 +98,4 @@ The input csv file must be in the same format as the training files (i.e., it mu
 Note that the `--use_vj` option must be used consistently, i.e., either by all three commands (`preprocess_data`, `train_model`, `predict`), or by none of them.
 
 
-
+Note that AIRRTM is quite CPU-heavy, so it may not be optimized for running on a 'normal' consumer computers.
