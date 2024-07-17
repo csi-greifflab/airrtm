@@ -39,7 +39,13 @@ def main():
     parser.add_argument('-m', '--model_file', required=True)
     parser.add_argument('-l', '--max_len', type=int, required=True)
     parser.add_argument('--translate', action='store_true')
-    parser.add_argument('--from_metadata', action='store_true')
+    parser.add_argument(
+        '--from_metadata',
+        action='store_true',
+        help='Whether to read input files from a metadata file. ' +\
+            'If this argument is passed, prediction is performed for all data files listed in the metadata file. ' +\
+            'If not, <input_file> is assumed to be the data file'
+    )
     parser.add_argument('--use_vj', action='store_true')
 
 

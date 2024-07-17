@@ -37,7 +37,6 @@ def preprocess_seq_list(seqs, max_len, alphabet):
     seqs = [seq[:max_len].upper() for seq in seqs]
     array = np.array([label_encoder.transform(list(seq) + [alphabet[0]] * (max_len - len(seq))) for seq in seqs])
     res = array.reshape(-1, max_len, 1)
-    # res = tf.one_hot(array, depth=alphabet_size).numpy()
     return res
 
 
@@ -53,7 +52,6 @@ def preprocess_vg_gene_list(vj_lists, vj_dict):
 def load_data(
     input_data_dir, witness_rate, max_len, min_len, alphabet,
     # n_samples,
-    n_seq=None,
     translate=True,
     use_vj=False,
 ):
@@ -78,10 +76,6 @@ def load_data(
         else:
             raise ValueError(f'Unknown format {filename}')
         samples_df = pd.read_csv(f'{input_data_dir}/samples/{witness_rate}/{filename}', sep=sep)
-        if n_seq is not None:
-            if samples_df.shape[0] < n_seq:
-                print('found only {samples_df.shape[0]} sequences when specified n_seq={n_seq}')
-            samples_df = samples_df.iloc[:n_seq]
         records = samples_df['cdr3_aa'].fillna('AAA').to_list()
         repertoires.append(records)
         if 'weight' in samples_df:

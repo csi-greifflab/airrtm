@@ -92,10 +92,15 @@ python train_model.py --input_data_dir INPUT_DATA_DIR -w WITNESS_RATE [-t THREAD
 
 And, with a trained model, make signal intensity predictions on sequences from an unseen repertoire, for example:
 ```
-predict.py -i INPUT_FILE -o OUTPUT_FILE -m CHECKPOINT_DIR/model_0.005_epoch_9.keras [--use_vj]
+predict.py -i INPUT_DATA_FILE -o OUTPUT_DIR -m CHECKPOINT_DIR/model_0.005_epoch_9.keras [--use_vj]
 ```
 The input csv file must be in the same format as the training files (i.e., it must have a column `cdr3_aa` with amino acid sequences).
 Note that the `--use_vj` option must be used consistently, i.e., either by all three commands (`preprocess_data`, `train_model`, `predict`), or by none of them.
+
+Alternatively, one can make signal intensity predictions for all files listed in the metadata file (in the same format and as described above, the paths in the metadatafile are assumed to be relative of the metadata file itself):
+```
+predict.py --from-metadata -i INPUT_METADATA_FILE -o OUTPUT_DIR -m CHECKPOINT_DIR/model_0.005_epoch_9.keras [--use_vj]
+```
 
 
 Note that AIRRTM is quite CPU-heavy, so it may not be optimized for running on a 'normal' consumer computers.
