@@ -1,0 +1,14 @@
+__all__ = [
+    "NT_ALPHABET",
+    "AA_ALPHABET",
+    "AA_NOSTOP_ALPHABET",
+    "ALPHABETS",
+]
+
+NT_ALPHABET = tuple("ACGT")
+AA_ALPHABET = tuple("RHKDESTNQCGPAVILMFYW*")
+AA_NOSTOP_ALPHABET = AA_ALPHABET[:-1]
+ALPHABETS = {
+    "nt": NT_ALPHABET,
+    "aa": AA_ALPHABET,
+}
