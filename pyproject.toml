@@ -1,0 +1,41 @@
+[tool.poetry]
+name = "airrtm"
+version = "2.0.0"
+description = "airrtm: a package for topic modeling on AIRR repertoires"
+authors = ["Andrei Slabodkin <andrey.slabodkin@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.11"
+torch = ">=2.0.1"
+pandas = ">=2.0.1"
+pytest = "*"
+pyyaml = "*"
+tqdm = "*"
+x_transformers = "*"
+python-dotenv = ">=1.0.1"
+tensorboard = "*"
+xlstm = {git = "git@github.com:myscience/x-lstm.git" }
+lightning = "*"
+
+[tool.poetry.group.dev.dependencies]
+black = {version = "*", extras = ["jupyter"]}
+isort = "*"
+ipykernel = ">=6.27.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+preprocess-single-repertoire = "airrtm.cli.preprocess_sequences:preprocess_single_repertoire"
+preprocess-from-csv = "airrtm.cli.preprocess_sequences:preprocess_from_csv"
+train-model = "airrtm.cli.train:main"
+
+### External tools configuration #######################################################
+
+[tool.distutils.bdist_wheel]
+universal = true
+
+[tool.isort]
+profile = "black"

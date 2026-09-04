@@ -1,0 +1,44 @@
+model_config:
+  encoder_type: "transformer"
+  encoder_params:
+    max_sequence_length: null
+    alphabet_length: 21
+    attention_dim: 22
+    attention_dim_head: 8
+    attention_heads: 8
+    depth: 4
+    use_positional_encodings: false
+  decoder_type: "transformer"
+  decoder_params:
+    max_sequence_length: null
+    alphabet_length: 21
+    attention_dim: 22
+    attention_dim_head: 8
+    attention_heads: 8
+    depth: 4
+    use_positional_encodings: false
+  airrtm_params:
+    n_repertoires: null
+    latent_dim: 40
+    n_topics_signal: 10
+    n_topics_nonsignal: 20
+training_config:
+  log_dir_suffix: "logs"
+  device: "cuda:0"
+  seed: 239
+  n_epochs: 100
+  patience: 250
+  val_size: 0.1
+  learning_rate: 0.00001
+  weight_decay: 0.02
+  n_sequences_per_repertoire_in_batch: 2048
+  n_repertoires_in_batch: 4
+  loss_config:
+    vae_coef: 0.06
+    # reconstruction_loss_coef: 0.95
+    reconstruction_loss_coef: 0.0
+    tm_likelihood_coef: 0.00
+    topic_l1_coef: 0.0
+    # vae_coef: 0.05
+    # reconstruction_loss_coef: 0.95
+    # tm_likelihood_coef: 0.95
