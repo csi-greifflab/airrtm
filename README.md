@@ -1,106 +1,151 @@
 # AIRRTM
 
+This repository contains the code of the AIRRTM model from the article [Weakly supervised identification and generation of adaptive immune receptor sequences associated with immune disease status](https://www.biorxiv.org/content/10.1101/2023.09.24.558823v1).
 
-This repository contains the code of the AIRRTM model from the article [Weakly supervised identification and generation of adaptive immune receptor sequences associated with immune disease status](https://www.biorxiv.org/content/10.1101/2023.09.24.558823v1). 
+AIRRTM learns which immune receptor sequences drive a **repertoire-level** binary label,
+using only repertoire labels — no per-sequence annotation. It couples a sequence VAE to a
+topic model: repertoire→topic proportions `Theta`, sequence→topic probabilities `Phi`, and a
+loss combining the topic-model likelihood, a repertoire-label term, and the VAE objective.
+
+`v2` (this branch) is the PyTorch reimplementation. See [`PLAN.md`](PLAN.md) for the current
+work plan and the rationale behind the recent changes.
 
 ## Installation
 
-### Pipenv
-A locked Pipenv environment is provided with the repository.
-To install the package, you need to run 
 ```shell
-pipenv shell
-pipenv install
-```
-The only prerequisites are havinng Pipenv and python3.9 installed on your machine.
-
-### requirements.txt
-Alternatively, you can use the `requirements.txt` file to install the dependencies in a *clean python3.9 environemnt*:
-```shell
-python -m pip install -r requirements.txt
+poetry install
 ```
 
+Python >= 3.11. The evaluation module additionally needs `scikit-learn` and `scipy`, both
+declared in `pyproject.toml`.
 
 ## Data
-Two synthetic datasets used in the article can be found in the corresponding [repository](https://github.com/csi-greifflab/airrtm_data). Note that you would need to unzip the data file for given dataset and witness rate (for example, [dataset S1, wr=0.0001](https://github.com/csi-greifflab/airrtm_data/blob/main/S1/samples/0.0001/data.zip)) before running training/prediction on them.
 
-The model can be trained on a dataset with the following structure:
+The two synthetic datasets used in the article are in a [separate repository](https://github.com/csi-greifflab/airrtm_data).
+
+Expected input layout:
+
 ```
 INPUT_DATA_DIR
-│
-└───samples
-    │
-    └───WITNESS_RATE
-    │   │   1.csv
-    │   │   2.csv
-    │   │   ...
-    │   │   99.csv
-    │   │   99.csv
-    │   │   metadata.csv
+│   metadata.csv
+│   repertoire_1.tsv
+│   repertoire_2.tsv
+│   ...
 ```
 
-Each of the data csv files must contain a column `cdr3_aa` with amino acid sequences.
-```
-$ head S1/samples/0.005/1.csv
-cdr3_aa
-CARDGRNTGIVGALTDPGMLLIS
-CARGFGQPSSSW*SGWFDPW
-CARDSSSWTT
-CARDLRKGDYYDSSGYYYAFMMLLIS
-CARERGRTVTVDYW
-CARGCFFSMVRGVIITFRMLLIS
-CARKFRWGRTGSAT
-CARVVLLWFGELFDYGMDVW
-CARDLIRGTLL*LL
-```
+`metadata.csv` must have columns `label` (repertoire label), `filename`, and `split`
+(`train`/`test`):
 
-Additionally, optional columns `v_gene`, `j_gene` (to use with the `--use_vj` option), and `weight` (is used automatically when present) may be provided. 
 ```
-cdr3_aa,v_gene,j_gene,weight
-CATSRDVNTGELFF,TCRBV15-01,TCRBJ02-02,1
-CASSPPGANVLTF,TCRBV11-02,TCRBJ02-06,1
-CASSEYEQYF,TCRBV06-01,TCRBJ02-07,1
-CASSLHEQYF,TCRBV11-02,TCRBJ02-07,9
-CASSAATGATEAFF,TCRBV05-04,TCRBJ01-01,2
-CASSPTGGHTEAFF,TCRBV05-04,TCRBJ01-01,2
-CASSPQGAYNEQFF,TCRBV05-04,TCRBJ02-01,2
-CASWGVNRGDAGYTF,TCRBV25-01,TCRBJ01-02,5042
-CASSAQQGYSGNTIYF,TCRBV28-01,TCRBJ01-03,2247
-```
-
-The metadata file must contain columns `label` (i.e., repertoire label), `filename` and `split` (train/test). 
-```
-$ head S1/samples/0.005/metadata.csv
 label,filename,split
-1,0.csv,train
-0,1.csv,train
-1,2.csv,train
-1,3.csv,train
+1,P00492.tsv,train
+0,P00413.tsv,train
+1,P00875.tsv,test
 ```
+
+Each sequence file must have a column `cdr3_aa`. These optional columns are used when present:
+
+| column | effect |
+|---|---|
+| `duplicate_count` | identical clonotypes are collapsed into one weighted row, and sequences are sampled in proportion to clonal abundance |
+| `v_call`, `j_call` | V/J gene embeddings are concatenated to the sequence latent before the topic layer |
+
+Pass `--no-counts`, `--no-vj` or `--no-dedup` to preprocessing to ignore them.
 
 ## Usage
 
-To train the model, one must first run `preprocess_data.py` on your dataset folder (structured as described above)
-```
-python preprocess_data.py --input_data_dir INPUT_DATA_DIR -w WITNESS_RATE [--use_vj]
+### 1. Preprocess
+
+```shell
+preprocess-from-csv \
+    --input_dir INPUT_DATA_DIR \
+    --output_dir PROCESSED_DATA_DIR \
+    --max_len 26 --min_len 4 --min_n_sequences 10000
 ```
 
-Then you can train the model by running
-```
-python train_model.py --input_data_dir INPUT_DATA_DIR -w WITNESS_RATE [-t THREADS] [--use_vj] --checkpoint_dir CHECKPOINT_DIR
+Every repertoire is padded **and truncated** to exactly `--max_len`, so all repertoires can be
+concatenated into a single batch. Writes one `.pt` per repertoire, a filtered `metadata.csv`,
+and (when V/J columns exist) a shared `gene_vocabulary.pt`.
+
+### 2. Train
+
+```shell
+train-model \
+    --input_dir PROCESSED_DATA_DIR \
+    --output_dir MODEL_DIR \
+    --config emerson_run/config.yaml \
+    [--repertoire_slice 0:32]
 ```
 
-And, with a trained model, make signal intensity predictions on sequences from an unseen repertoire, for example:
-```
-python predict.py -l <MAX_LEN_USED_FOR_TRAINING> -i INPUT_DATA_FILE -o OUTPUT_DIR -m CHECKPOINT_DIR/model_0.005_epoch_9.keras [--use_vj]
-```
-The input csv file must be in the same format as the training files (i.e., it must have a column `cdr3_aa` with amino acid sequences).
-Note that the `--use_vj` option must be used consistently, i.e., either by all three commands (`preprocess_data`, `train_model`, `predict`), or by none of them.
+Training uses **repertoire mini-batching**: each optimizer step sees
+`n_repertoires_in_batch` repertoires contributing `n_sequences_per_repertoire_in_batch`
+sequences each. Both the MIL label term and the batch-normalised topic-model likelihood need
+several repertoires per step. `--repertoire_slice` restricts the run to a few repertoires for
+a quick shakedown.
 
-Alternatively, one can make signal intensity predictions for all files listed in the metadata file (in the same format and as described above, the paths in the metadatafile are assumed to be relative of the metadata file itself):
-```
-python predict.py -l <MAX_LEN_USED_FOR_TRAINING> --from_metadata -i INPUT_METADATA_FILE -o OUTPUT_DIR -m CHECKPOINT_DIR/model_0.005_epoch_9.keras [--use_vj]
+Writes `model.pt` (weights plus the config needed to rebuild the module), `config.yaml`,
+`history.json`, TensorBoard logs, and per-epoch checkpoints.
+
+### 3. Evaluate
+
+```shell
+evaluate-model \
+    --input_dir PROCESSED_DATA_DIR \
+    --model MODEL_DIR/model.pt \
+    --output_dir MODEL_DIR/evaluation
 ```
 
+Reports, on the held-out `split == "test"` repertoires:
 
-Note that AIRRTM is quite CPU-heavy, so it may not be optimized for running on a 'normal' consumer computers.
+- ROC-AUC / PR-AUC / F1 for repertoire classification, from the quantile representation of
+  per-sequence signal intensities and (for amortized models) directly from topic proportions;
+- the same metrics for the Emerson-2017 Fisher-exact burden-score baseline;
+- per-topic separation between positive and negative repertoires (`topic_separation.csv`);
+- the top-ranked candidate sequences (`top_candidate_sequences.csv`) and the sequences that
+  load most strongly on each topic (`top_sequences_per_topic.csv`).
+
+For the synthetic datasets, where ground-truth sequence labels exist,
+`airrtm.evaluation.precision_at_k` and `signal_enrichment` reproduce the paper's Fig. 2A
+precision curves.
+
+### 4. Generate
+
+`airrtm.evaluation.generation` implements Methods 5: fit a diagonal Gaussian to the latents of
+the top-scoring sequences, sample at a range of temperatures, and decode.
+
+## Configuration
+
+Key options in `config.yaml`:
+
+| option | meaning |
+|---|---|
+| `airrtm_params.theta_mode` | `amortized` infers repertoire topic proportions from a sample of the repertoire's own sequences, so **unseen repertoires can be scored**. `free` is the original per-repertoire embedding (training repertoires only). `both` uses the free row as a residual. |
+| `loss_config.tm_likelihood_coef` | Weight of the topic-model likelihood. At `0.0` the model degenerates into plain noisy-label MIL with no topic structure. |
+| `loss_config.vae_coef`, `reconstruction_loss_coef` | The VAE branch. `reconstruction_loss_coef: 0.0` makes it pure KL. |
+| `training_config.tau`, `tau_start` | MIL pooling temperature. `tau -> 0` pools per-sequence label logits towards their mean, `tau -> inf` towards their max; `tau_start` anneals between them. |
+| `encoder_params.pooling` | `mean_max` pools over positions with the padding mask applied; `flatten` concatenates all positions (position-dependent, the original behaviour). |
+| `data_config.use_vj`, `abundance_weighted_sampling` | Use V/J genes and clonal counts when the data carries them. |
+
+## Emerson run
+
+`emerson_run/` holds the driver scripts for the Emerson CMV dataset. Copy
+`emerson_run/.env.example` to `emerson_run/.env`, adjust the paths, then:
+
+```shell
+python 1_preprocess_repertoires.py
+./2_train_model.sh my_model
+./3_evaluate_model.sh my_model
+```
+
+The two notebooks in that directory predate the CLIs and call an older API; the shell scripts
+above are the supported path.
+
+## Tests
+
+```shell
+PYTHONPATH=.:tests pytest tests/
+```
+
+## Legacy
+
+`archive/` holds the original TensorFlow implementation from the paper.

@@ -15,8 +15,10 @@ tqdm = "*"
 x_transformers = "*"
 python-dotenv = ">=1.0.1"
 tensorboard = "*"
-xlstm = {git = "git@github.com:myscience/x-lstm.git" }
 lightning = "*"
+numpy = "*"
+scipy = "*"
+scikit-learn = "*"
 
 [tool.poetry.group.dev.dependencies]
 black = {version = "*", extras = ["jupyter"]}
@@ -31,6 +33,7 @@ build-backend = "poetry.core.masonry.api"
 preprocess-single-repertoire = "airrtm.cli.preprocess_sequences:preprocess_single_repertoire"
 preprocess-from-csv = "airrtm.cli.preprocess_sequences:preprocess_from_csv"
 train-model = "airrtm.cli.train:main"
+evaluate-model = "airrtm.cli.evaluate:main"
 
 ### External tools configuration #######################################################
 

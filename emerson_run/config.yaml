@@ -1,44 +1,82 @@
 model_config:
   encoder_type: "transformer"
   encoder_params:
-    max_sequence_length: null
-    alphabet_length: 21
-    attention_dim: 22
-    attention_dim_head: 8
+    max_sequence_length: null   # filled in from the data
+    alphabet_length: null       # filled in from the data
+    attention_dim: 64
+    attention_dim_head: 32      # x_transformers wants >= 32 for rotary embeddings
     attention_heads: 8
     depth: 4
-    use_positional_encodings: false
+    use_positional_encodings: true
+    # "mean_max" pools over positions with the padding mask applied, so the latent
+    # no longer depends on where in the padded window a residue happens to sit.
+    pooling: "mean_max"
+    mask_padding: true
   decoder_type: "transformer"
   decoder_params:
     max_sequence_length: null
-    alphabet_length: 21
-    attention_dim: 22
-    attention_dim_head: 8
+    alphabet_length: null
+    attention_dim: 64
+    attention_dim_head: 32
     attention_heads: 8
     depth: 4
-    use_positional_encodings: false
+    use_positional_encodings: true
   airrtm_params:
-    n_repertoires: null
-    latent_dim: 40
+    n_repertoires: null         # filled in from the data
+    latent_dim: 64
     n_topics_signal: 10
     n_topics_nonsignal: 20
+    # "amortized" infers topic proportions from a sample of the repertoire's own
+    # sequences, so held-out repertoires can be scored at all. "free" reproduces the
+    # original per-repertoire embedding (training repertoires only); "both" uses the
+    # free row as a residual on top of the amortized logits.
+    theta_mode: "amortized"
+    vj_embedding_dim: 16
+
+data_config:
+  use_vj: true
+  # Draw sequences in proportion to duplicate_count: clonal expansion is signal.
+  abundance_weighted_sampling: true
+
 training_config:
   log_dir_suffix: "logs"
   device: "cuda:0"
   seed: 239
-  n_epochs: 100
-  patience: 250
+  n_epochs: 200
+  patience: 25
   val_size: 0.1
-  learning_rate: 0.00001
-  weight_decay: 0.02
-  n_sequences_per_repertoire_in_batch: 2048
-  n_repertoires_in_batch: 4
+  learning_rate: 0.0003
+  weight_decay: 0.0
+  lr_decay_gamma: null
+  grad_clip: 1.0
+  n_sequences_per_repertoire_in_batch: 1024
+  n_repertoires_in_batch: 8
+  min_repertoire_size: 32768
+  # Sequences are sampled with replacement, so epoch length is a free choice. With
+  # 597 repertoires an uncapped epoch is ~2300 steps; 4 keeps it near 300 so
+  # validation, checkpoints and early stopping happen at a watchable cadence.
+  n_batches_per_repertoire: 4
+  n_batches_per_repertoire_val: 1
+  log_every: 20
+  checkpoint_every: 5
+  # MIL pooling temperature: tau -> 0 pools the per-sequence label logits towards
+  # their mean, tau -> inf towards their max. Annealing up starts from the stable
+  # mean and sharpens onto individual signal sequences.
+  tau: 1.0
+  tau_start: 0.1
   loss_config:
-    vae_coef: 0.06
-    # reconstruction_loss_coef: 0.95
-    reconstruction_loss_coef: 0.0
-    tm_likelihood_coef: 0.00
+    # total = vae_coef * (rec_coef * rec + (1 - rec_coef) * kl)
+    #       + (1 - vae_coef) * (tm_coef * tm + (1 - tm_coef) * label)
+    #       + the regularisers below.
+    vae_coef: 0.05
+    reconstruction_loss_coef: 0.95
+    # Non-zero again now that the TM likelihood is normalised over the batch; with
+    # tm_likelihood_coef: 0.0 the model degenerates to plain noisy-label MIL.
+    tm_likelihood_coef: 0.5
+    positive_class_weight: 0.5
     topic_l1_coef: 0.0
-    # vae_coef: 0.05
-    # reconstruction_loss_coef: 0.95
-    # tm_likelihood_coef: 0.95
+    theta_entropy_coef: 0.0
+    topic_decorrelation_coef: 0.0
+    # Cap the in-batch negative pool for the TM partition function; null uses the
+    # whole batch (n_repertoires_in_batch * n_sequences_per_repertoire_in_batch).
+    tm_max_negatives: null

@@ -1,7 +1,5 @@
 import torch
 
-# from x_transformers import TransformerWrapper, Decoder
-
 from x_transformers import ContinuousTransformerWrapper, Encoder
 
 
@@ -15,6 +13,9 @@ class BaseDecoder(torch.nn.Module):
     L: latent space dimension
     E: attention (embedding) dimension
 
+    Decoders return **logits** over the alphabet, not probabilities: the
+    reconstruction loss applies its own ``log_softmax``, and applying softmax here
+    too would flatten the gradients.
     """
 
     def __init__(
@@ -61,8 +62,7 @@ class TransformerDecoder(BaseDecoder):
         )
 
         self.transformer = ContinuousTransformerWrapper(
-            # num_tokens=self.alphabet_length + 1,  # +1 because pad value is a token too
-            dim_in=self.attention_dim,  # VAE latent dim
+            dim_in=self.attention_dim,
             dim_out=self.alphabet_length + 1,  # +1 because pad value is a token too
             max_seq_len=self.max_sequence_length,
             attn_layers=Encoder(
@@ -72,61 +72,21 @@ class TransformerDecoder(BaseDecoder):
                 heads=self.attention_heads,
                 rotary_pos_emb=self.use_positional_encodings,
                 attn_one_kv_head=False,
-                unet_skips=False,  # (self.depth > 1),
+                unet_skips=False,
                 residual_attn=False,
-                # cross_attend=True,
                 cross_attend=False,
-                # # layer_dropout=0,
-                # # attn_dropout=self.dropout_rate,
-                # # ff_dropout=self.dropout_rate,
             ),
-            # return_only_embed=False,
         )
-        # self.transformer = TransformerWrapper(
-        #     num_tokens=self.alphabet_length + 1,  # +1 because pad value is a token too
-        #     max_seq_len=self.max_sequence_length,
-        #     attn_layers=Decoder(
-        #         dim=self.attention_dim,
-        #         attn_dim_head=self.attention_dim_head,
-        #         depth=self.depth,
-        #         heads=self.attention_heads,
-        #         rotary_pos_emb=self.use_positional_encodings,
-        #         attn_one_kv_head=False,
-        #         unet_skips=False,  # (self.depth > 1),
-        #         residual_attn=False,
-        #         # cross_attend=True,
-        #         cross_attend=False,
-        #         # # layer_dropout=0,
-        #         # # attn_dropout=self.dropout_rate,
-        #         # # ff_dropout=self.dropout_rate,
-        #     ),
-        #     # return_only_embed=False,
-        # )
 
     def forward(
         self,
         x_SL: torch.Tensor,
     ) -> torch.Tensor:
-        # aa_probabilities_SPA = torch.nn.functional.softmax(x_SL, dim=2)
-        # return aa_probabilities_SPA
-
-        # starting_sequence_SP = self.generate_empty_starting_sequence(x_SL.shape[0]).to(
-        #     x_SL.device
-        # )
-        # context_SPE = self.starting_linear_layer(x_SL).reshape(
-        #     -1, self.max_sequence_length, self.attention_dim
-        # )
-        # return self.transformer(starting_sequence_SP, context=context_SPE)
-
         starting_sequence_SPE = self.starting_linear_layer(x_SL).reshape(
             -1, self.max_sequence_length, self.attention_dim
         )
-        # starting_sequence_SPE = torch.nn.functional.relu(starting_sequence_SPE)
-        transformer_output_SPA = self.transformer(starting_sequence_SPE)
-        aa_probabilities_SPA = torch.nn.functional.softmax(
-            transformer_output_SPA, dim=2
-        )
-        return aa_probabilities_SPA
+        # Logits, deliberately: see the note on BaseDecoder.
+        return self.transformer(starting_sequence_SPE)
 
     def generate_empty_starting_sequence(self, batch_size) -> torch.Tensor:
         return torch.full(
@@ -153,21 +113,9 @@ class LSTMDecoder(BaseDecoder):
         self.time_distributed_linear = torch.nn.Linear(
             self.input_dim // self.max_sequence_length, self.alphabet_length + 1
         )
-        # self.lstm_model = torch.nn.LSTM(
-        #     input_size=self.input_size,
-        #     hidden_size=self.hidden_size,
-        #     num_layers=self.num_layers,
-        #     batch_first=True,
-        #     bidirectional=True,
-        # )
 
-    # def forward(self, x_SLE, hidden):
     def forward(self, x_SL):
         x_SPL = x_SL.reshape(
             -1, self.max_sequence_length, self.input_dim // self.max_sequence_length
         )
-        x_SPA = self.time_distributed_linear(x_SPL)
-        return x_SPA
-        # lstm_output, (hidden, cell) = self.lstm_model(x_SLE, hidden)
-        # output = self.linear_output(lstm_output)
-        # return output, (hidden, cell)
+        return self.time_distributed_linear(x_SPL)

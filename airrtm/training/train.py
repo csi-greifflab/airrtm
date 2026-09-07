@@ -1,5 +1,8 @@
 import pathlib as pl
 
+from dataclasses import dataclass
+
+import numpy as np
 import torch
 
 from torch.utils.tensorboard import SummaryWriter
@@ -13,13 +16,47 @@ from airrtm.models import AIRRTM_Model
 from airrtm.types import AIRRTM_ModelOutput, AIRRTM_ModelTarget
 from airrtm.utils import SequenceDataset
 
+
 LOSS_KEY_TO_PRINT = {
     "total_loss": "total",
+    "reconstruction_loss": "rec",
     "reconstruction_accuracy": "rec_acc",
     "kl_divergence": "kl_d",
     "tm_loss": "tm",
+    "label_loss": "label",
     "label_accuracy": "label_acc",
+    "topic_l1": "l1",
+    "theta_entropy": "H_theta",
+    "topic_usage_entropy": "H_usage",
+    "topic_decorrelation": "decorr",
+    "predicted_witness_rate": "wr",
 }
+
+#: Repertoires smaller than this are sampled with replacement, so that every
+#: repertoire contributes the same number of sequences per epoch regardless of size.
+DEFAULT_MIN_REPERTOIRE_SIZE = 32768
+
+
+@dataclass
+class Batch:
+    """One training step's worth of sequences, drawn from several repertoires.
+
+    The ``theta_*`` fields hold a second, disjoint draw from the same repertoires,
+    used only to infer their topic proportions. They are ``None`` when Theta is
+    pooled from the scored sequences themselves.
+    """
+
+    sequences: torch.Tensor  # (S, P) long
+    repertoire_ids: torch.Tensor  # (S,) long, index into the full repertoire list
+    labels: torch.Tensor  # (S,) repertoire label, broadcast per sequence
+    v_ids: torch.Tensor | None
+    j_ids: torch.Tensor | None
+    weights: torch.Tensor | None  # (S,) clonal abundance, or None
+    theta_sequences: torch.Tensor | None = None
+    theta_repertoire_ids: torch.Tensor | None = None
+    theta_v_ids: torch.Tensor | None = None
+    theta_j_ids: torch.Tensor | None = None
+    theta_weights: torch.Tensor | None = None
 
 
 def train_model(
@@ -27,268 +64,498 @@ def train_model(
     model: AIRRTM_Model,
     sequence_datasets_train: list[SequenceDataset],
     sequence_datasets_val: list[SequenceDataset],  #  from the same repertoires as train
-    repertoire_labels: torch.IntTensor,  # assumed to be 1d and consist of 1s and 0s
+    repertoire_labels: torch.Tensor,  # assumed to be 1d and consist of 1s and 0s
     criterion: CompositeLoss,
     optimizer: torch.optim.Optimizer,
     n_epochs: int,
     patience: int,
     n_sequences_per_repertoire_in_batch: int,
+    n_repertoires_in_batch: int = 4,
+    min_repertoire_size: int = DEFAULT_MIN_REPERTOIRE_SIZE,
+    n_batches_per_repertoire: int | None = None,
+    n_batches_per_repertoire_val: int | None = None,
+    n_theta_sequences_per_repertoire: int = 0,
+    tau: float = 1.0,
+    tau_start: float | None = None,
+    tau_anneal_epochs: int | None = None,
+    abundance_weighted_sampling: bool = True,
+    grad_clip: float | None = None,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     device: torch.device | None = None,
     log_dir: pl.Path | None = None,
+    log_every: int = 20,
     checkpoint_dir: pl.Path | None = None,
+    checkpoint_every: int = 1,
     keep_best_model: bool = True,
-) -> None:
+) -> dict[str, list[dict[str, float]]]:
+    """Train an AIRRTM model with repertoire mini-batching.
+
+    Each optimizer step sees ``n_repertoires_in_batch`` repertoires contributing
+    ``n_sequences_per_repertoire_in_batch`` sequences each. Both the label loss (a
+    per-bag MIL term) and the TM loss (normalised over the batch) need several
+    repertoires per step, so the repertoire axis is genuinely batched rather than
+    taken whole -- taking all 597 Emerson repertoires at once, as the previous
+    implementation did, needs ~1.2M sequences in a single forward pass.
+
+    ``tau_start`` optionally anneals the MIL pooling temperature geometrically from
+    ``tau_start`` to ``tau`` across epochs: a low temperature pools towards the mean
+    (a stable but weak signal), a high one towards the max (sharp, but easy to get
+    stuck on a single sequence).
+    """
     device = device or torch.tensor(0.0).device
 
-    writer = None
-    if log_dir is not None:
-        writer = SummaryWriter(log_dir=log_dir, flush_secs=1)
+    writer = SummaryWriter(log_dir=log_dir, flush_secs=1) if log_dir else None
+    if checkpoint_dir is not None:
+        checkpoint_dir = pl.Path(checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     n_repertoires = len(sequence_datasets_train)
-    total_batch_size = n_repertoires * n_sequences_per_repertoire_in_batch
-    repertoire_sizes_train = [d.size() for d in sequence_datasets_train]
-    minimum_repertoire_size_train = min(repertoire_sizes_train)
-    repertoire_sizes_val = [d.size() for d in sequence_datasets_val]
-    minimum_repertoire_size_val = min(repertoire_sizes_val)
-    n_batches_train = (
-        minimum_repertoire_size_train // n_sequences_per_repertoire_in_batch
-    )
-    n_batches_val = minimum_repertoire_size_val // n_sequences_per_repertoire_in_batch
+    if n_repertoires < n_repertoires_in_batch:
+        raise ValueError(
+            f"n_repertoires_in_batch={n_repertoires_in_batch} exceeds the number of "
+            f"repertoires ({n_repertoires})"
+        )
+    repertoire_labels = repertoire_labels.to(device)
 
+    sizes_train = [d.size() for d in sequence_datasets_train]
+    sizes_val = [d.size() for d in sequence_datasets_val]
+    # How many batches each repertoire contributes per epoch. Sampling is with
+    # replacement, so this is a free choice of epoch length rather than a property of
+    # the data: with 597 repertoires an uncapped epoch is thousands of steps, which
+    # makes validation and early stopping far too coarse to watch.
+    if n_batches_per_repertoire is None:
+        n_batches_per_repertoire = max(
+            min(sizes_train) // n_sequences_per_repertoire_in_batch, 1
+        )
+    if n_batches_per_repertoire_val is None:
+        n_batches_per_repertoire_val = max(
+            max(min(sizes_val), min_repertoire_size)
+            // n_sequences_per_repertoire_in_batch,
+            1,
+        )
+    n_batches_per_repertoire_train = n_batches_per_repertoire
+    n_groups = n_repertoires // n_repertoires_in_batch
+
+    print(f"min rep size train: {min(sizes_train)}, min rep size val: {min(sizes_val)}")
+    print(f"max rep size train: {max(sizes_train)}, max rep size val: {max(sizes_val)}")
     print(
-        f"min rep size train: {minimum_repertoire_size_train}, min rep size val: {minimum_repertoire_size_val}"
+        f"steps/epoch: {n_batches_per_repertoire_train * n_groups} train, "
+        f"{n_batches_per_repertoire_val * n_groups} val "
+        f"({n_batches_per_repertoire_train} x {n_groups} repertoire groups)"
     )
     print(
-        f"max rep size train: {max(repertoire_sizes_train)}, max rep size val: {max(repertoire_sizes_val)}"
+        f"batch: {n_repertoires_in_batch} repertoires x "
+        f"{n_sequences_per_repertoire_in_batch} sequences = "
+        f"{n_repertoires_in_batch * n_sequences_per_repertoire_in_batch} sequences"
     )
-    print(f"{n_batches_train=}, {n_batches_val=}")
-    print(f"{total_batch_size=}")
-    assert n_batches_train >= 1, n_batches_val >= 1
+    if n_theta_sequences_per_repertoire:
+        print(
+            f"theta inferred from a disjoint sample of "
+            f"{n_theta_sequences_per_repertoire} sequences per repertoire"
+        )
+
+    probabilities_train = _sampling_probabilities(
+        sequence_datasets_train, abundance_weighted_sampling
+    )
+    probabilities_val = _sampling_probabilities(
+        sequence_datasets_val, abundance_weighted_sampling
+    )
 
     model = model.to(device)
     early_stopping_counter = 0
     best_val_loss = torch.inf
-    best_state_dict = model.state_dict().copy()
+    best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     best_epoch = 0
 
-    loss_keys = ["total_loss"]
-    if criterion.return_individual_compotents:
-        loss_keys.extend(
-            ["reconstruction_accuracy", "kl_divergence", "tm_loss", "label_accuracy"]
-        )
-    train_loss_list = []
-    val_loss_list = []
+    loss_keys = _loss_keys(criterion)
+    history = {"train": [], "val": []}
 
-    sequence_repertoire_labels = torch.concatenate(
-        [
-            torch.full(fill_value=label, size=(n_sequences_per_repertoire_in_batch,))
-            for label in repertoire_labels
-        ]
-    ).to(device)
-    sequence_repertoire_indicators = torch.ones_like(sequence_repertoire_labels).to(
-        device
-    )
-
-    self_repertoire_ids = torch.concatenate(
-        [
-            torch.full(fill_value=i, size=(n_sequences_per_repertoire_in_batch,))
-            for i in range(n_repertoires)
-        ]
-    ).to(device)
-    for epoch in tqdm(range(n_epochs)):
-        shuffled_sequence_indices = [
-            torch.randperm(size) for size in repertoire_sizes_train
-        ]
-        other_repertoire_ids = _sample_other_repertoire_ids(
-            repertoire_labels, n_sequences_per_repertoire_in_batch
-        ).to(device)
-
+    taus = _tau_schedule(tau_start, tau, n_epochs, tau_anneal_epochs)
+    global_step = 0
+    recent = {key: 0.0 for key in loss_keys}
+    for epoch in range(n_epochs):
+        epoch_tau = taus[epoch]
         model.train()
-        running_loss = {key: 0.0 for key in loss_keys}
+        running = {key: 0.0 for key in loss_keys}
+        n_steps = 0
 
-        with tqdm(total=n_batches_train, leave=False) as pbar:
-            for batch_id in range(n_batches_train):
-                x_batch_SP = (
-                    torch.concatenate(
-                        [
-                            dataset.data[
-                                indices[
-                                    batch_id
-                                    * n_sequences_per_repertoire_in_batch : (
-                                        batch_id + 1
-                                    )
-                                    * n_sequences_per_repertoire_in_batch
-                                ]
-                            ]
-                            for dataset, indices in zip(
-                                sequence_datasets_train, shuffled_sequence_indices
-                            )
-                        ],
-                        dim=0,
+        with tqdm(range(n_batches_per_repertoire_train), leave=False) as pbar:
+            for _ in pbar:
+                for group in _stratified_groups(
+                    repertoire_labels, n_repertoires_in_batch
+                ):
+                    batch = _make_batch(
+                        datasets=sequence_datasets_train,
+                        probabilities=probabilities_train,
+                        repertoire_indices=group,
+                        repertoire_labels=repertoire_labels,
+                        n_sequences=n_sequences_per_repertoire_in_batch,
+                        device=device,
+                        n_theta_sequences=n_theta_sequences_per_repertoire,
                     )
-                    .to(torch.long)
-                    .to(device)
-                )
-                self_predictions: AIRRTM_ModelOutput = model(
-                    self_repertoire_ids, x_batch_SP
-                )
-                self_targets = AIRRTM_ModelTarget(
-                    sequence_repertoire_indicators=sequence_repertoire_indicators,
-                    sequence_repertoire_labels=sequence_repertoire_labels,
-                    sequences=x_batch_SP,
-                )
-                self_loss = criterion(self_predictions, self_targets)
-
-                other_predictions: AIRRTM_ModelOutput = model(
-                    other_repertoire_ids, x_batch_SP
-                )
-                other_targets = AIRRTM_ModelTarget(
-                    sequence_repertoire_indicators=1 - sequence_repertoire_indicators,
-                    sequence_repertoire_labels=1 - sequence_repertoire_labels,
-                    sequences=x_batch_SP,
-                )
-                other_loss = criterion(other_predictions, other_targets)
-
-                loss = {
-                    key: (self_loss[key] + other_loss[key]) / 2 for key in loss_keys
-                }
-                loss["total_loss"].backward()
-                optimizer.step()
-                for key in loss_keys:
-                    running_loss[key] += loss[key].item()  # the loss is normalized here
-                averaged_loss = {
-                    key: running_loss[key] / (batch_id + 1) for key in loss_keys
-                }
-                if batch_id % 5 == 1:
-                    pbar.set_postfix(
-                        batch=batch_id,
-                        **{
-                            LOSS_KEY_TO_PRINT[key]: value
-                            for key, value in averaged_loss.items()
-                        },
+                    loss = _step(
+                        model=model,
+                        criterion=criterion,
+                        batch=batch,
+                        tau=epoch_tau,
                     )
-                    if writer is not None:
+                    optimizer.zero_grad(set_to_none=True)
+                    loss["total_loss"].backward()
+                    if grad_clip is not None:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    optimizer.step()
+
+                    n_steps += 1
+                    global_step += 1
+                    for key in loss_keys:
+                        value = float(loss[key].detach())
+                        running[key] += value
+                        recent[key] += value
+                    # Log a moving window rather than only the epoch mean, so the
+                    # curves are watchable while a long epoch is still running.
+                    if writer is not None and global_step % log_every == 0:
                         for key in loss_keys:
                             writer.add_scalars(
-                                key,
-                                {
-                                    "Train": averaged_loss[key],
-                                },
-                                epoch * n_batches_train + batch_id,
+                                key, {"Train": recent[key] / log_every}, global_step
                             )
-                pbar.update(1)
-            train_loss_list.append(
-                {key: running_loss[key] / n_batches_train for key in loss_keys}
+                        writer.add_scalar("tau", epoch_tau, global_step)
+                        recent = {key: 0.0 for key in loss_keys}
+                pbar.set_postfix(
+                    **{
+                        LOSS_KEY_TO_PRINT.get(key, key): running[key] / n_steps
+                        for key in loss_keys
+                    }
+                )
+        train_metrics = {key: running[key] / max(n_steps, 1) for key in loss_keys}
+        history["train"].append(train_metrics)
+
+        val_metrics = evaluate(
+            model=model,
+            criterion=criterion,
+            sequence_datasets=sequence_datasets_val,
+            probabilities=probabilities_val,
+            repertoire_labels=repertoire_labels,
+            n_sequences_per_repertoire_in_batch=n_sequences_per_repertoire_in_batch,
+            n_repertoires_in_batch=n_repertoires_in_batch,
+            n_batches_per_repertoire=n_batches_per_repertoire_val,
+            tau=epoch_tau,
+            device=device,
+            loss_keys=loss_keys,
+            n_theta_sequences_per_repertoire=n_theta_sequences_per_repertoire,
+        )
+        history["val"].append(val_metrics)
+
+        if writer is not None:
+            # Same x-axis as the per-step curves above, so Train and Val overlay.
+            for key in loss_keys:
+                writer.add_scalars(key, {"Val": val_metrics[key]}, global_step)
+            writer.add_scalar("epoch", epoch, global_step)
+
+        print(
+            f"epoch {epoch}: "
+            + " ".join(
+                f"{LOSS_KEY_TO_PRINT.get(k, k)}={val_metrics[k]:.4f}" for k in loss_keys
+            )
+        )
+
+        if scheduler is not None:
+            scheduler.step()
+
+        if val_metrics["total_loss"] < best_val_loss:
+            best_val_loss = val_metrics["total_loss"]
+            best_state_dict = {
+                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+            }
+            best_epoch = epoch
+            early_stopping_counter = 0
+        else:
+            early_stopping_counter += 1
+            if early_stopping_counter >= patience:
+                print(f"Stopping at epoch {epoch}")
+                break
+
+        if checkpoint_dir is not None and epoch % checkpoint_every == 0:
+            # A state dict, not a pickled module: pickled modules break as soon as the
+            # class is edited, which is how the earlier checkpoints became unloadable.
+            torch.save(
+                {"epoch": epoch, "state_dict": model.state_dict()},
+                checkpoint_dir / f"checkpoint_epoch_{epoch}.pt",
             )
 
-        model.eval()
-        with torch.no_grad():
-            shuffled_sequence_indices_val = [
-                torch.randperm(size) for size in repertoire_sizes_val
-            ]
-            other_repertoire_ids = _sample_other_repertoire_ids(
-                repertoire_labels, n_sequences_per_repertoire_in_batch
-            ).to(device)
-            running_loss = {key: 0.0 for key in loss_keys}
-            for batch_id in range(n_batches_val):
-                x_batch_SP = (
-                    torch.concatenate(
-                        [
-                            dataset.data[
-                                indices[
-                                    batch_id
-                                    * n_sequences_per_repertoire_in_batch : (
-                                        batch_id + 1
-                                    )
-                                    * n_sequences_per_repertoire_in_batch
-                                ]
-                            ]
-                            for dataset, indices in zip(
-                                sequence_datasets_val, shuffled_sequence_indices_val
-                            )
-                        ]
-                    )
-                    .to(torch.long)
-                    .to(device)
-                )
-                self_predictions: AIRRTM_ModelOutput = model(
-                    self_repertoire_ids, x_batch_SP
-                )
-                self_targets = AIRRTM_ModelTarget(
-                    sequence_repertoire_indicators=sequence_repertoire_indicators,
-                    sequence_repertoire_labels=sequence_repertoire_labels,
-                    sequences=x_batch_SP,
-                )
-                self_loss = criterion(self_predictions, self_targets)
-
-                other_predictions: AIRRTM_ModelOutput = model(
-                    other_repertoire_ids, x_batch_SP
-                )
-                other_targets = AIRRTM_ModelTarget(
-                    sequence_repertoire_indicators=1 - sequence_repertoire_indicators,
-                    sequence_repertoire_labels=1 - sequence_repertoire_labels,
-                    sequences=x_batch_SP,
-                )
-                other_loss = criterion(other_predictions, other_targets)
-
-                loss = {
-                    key: (self_loss[key] + other_loss[key]) / 2 for key in loss_keys
-                }
-                for key in loss_keys:
-                    running_loss[key] += loss[key].item()  # the loss is normalized here
-            val_loss_list.append(
-                {key: running_loss[key] / n_batches_val for key in loss_keys}
-            )
-
-            # Write to tensorboard
-            if writer is not None:
-                for key in loss_keys:
-                    writer.add_scalars(
-                        key,
-                        {
-                            "Val": val_loss_list[-1][key],
-                        },
-                        (epoch + 1) * n_batches_train - 1,
-                    )
-
-            if val_loss_list[-1]["total_loss"] < best_val_loss:
-                best_val_loss = val_loss_list[-1]["total_loss"]
-                best_state_dict = model.state_dict().copy()
-                best_epoch = epoch
-                early_stopping_counter = 0
-            else:
-                early_stopping_counter += 1
-                if early_stopping_counter >= patience:
-                    print(f"Stopping at epoch {epoch}")
-                    break
-
-        if checkpoint_dir is not None:
-            torch.save(model, checkpoint_dir / f"checkpoint_epoch_{epoch}.py")
     if writer is not None:
         writer.close()
 
     if keep_best_model:
         model.load_state_dict(best_state_dict)
-        print(f"Saving the model state at the best epoch ({best_epoch})")
+        print(f"Restored the model state at the best epoch ({best_epoch})")
+    return history
 
 
-def _sample_other_repertoire_ids(
+@torch.no_grad()
+def evaluate(
+    *,
+    model: AIRRTM_Model,
+    criterion: CompositeLoss,
+    sequence_datasets: list[SequenceDataset],
+    probabilities: list[torch.Tensor | None],
     repertoire_labels: torch.Tensor,
-    n_sequences_per_batch: int,
-) -> torch.Tensor:
-    positive_repertoire_ids = torch.where(repertoire_labels == 1)[0]
-    negative_repertoire_ids = torch.where(repertoire_labels == 0)[0]
-    other_repertoire_ids = [
-        negative_repertoire_ids if label == 1 else positive_repertoire_ids
-        for label in repertoire_labels
-    ]
-    other_repertoire_ids = [
-        repertoire_ids[
-            torch.randint(
-                low=0, high=repertoire_ids.shape[0], size=(n_sequences_per_batch,)
+    n_sequences_per_repertoire_in_batch: int,
+    n_repertoires_in_batch: int,
+    n_batches_per_repertoire: int,
+    tau: float,
+    device: torch.device,
+    loss_keys: list[str],
+    n_theta_sequences_per_repertoire: int = 0,
+) -> dict[str, float]:
+    model.eval()
+    n_repertoires = len(sequence_datasets)
+    n_groups = n_repertoires // n_repertoires_in_batch
+    running = {key: 0.0 for key in loss_keys}
+    n_steps = 0
+    for _ in range(n_batches_per_repertoire):
+        for group in _stratified_groups(repertoire_labels, n_repertoires_in_batch):
+            batch = _make_batch(
+                datasets=sequence_datasets,
+                probabilities=probabilities,
+                repertoire_indices=group,
+                repertoire_labels=repertoire_labels,
+                n_sequences=n_sequences_per_repertoire_in_batch,
+                device=device,
+                n_theta_sequences=n_theta_sequences_per_repertoire,
             )
-        ]
-        for repertoire_ids in other_repertoire_ids
+            loss = _step(model=model, criterion=criterion, batch=batch, tau=tau)
+            n_steps += 1
+            for key in loss_keys:
+                running[key] += float(loss[key].detach())
+    return {key: running[key] / max(n_steps, 1) for key in loss_keys}
+
+
+def _step(
+    *,
+    model: AIRRTM_Model,
+    criterion: CompositeLoss,
+    batch: Batch,
+    tau: float,
+) -> dict[str, torch.Tensor]:
+    predictions: AIRRTM_ModelOutput = model(
+        batch.repertoire_ids,
+        batch.sequences,
+        v_ids=batch.v_ids,
+        j_ids=batch.j_ids,
+        weights=batch.weights,
+        theta_sequences=batch.theta_sequences,
+        theta_repertoire_ids=batch.theta_repertoire_ids,
+        theta_v_ids=batch.theta_v_ids,
+        theta_j_ids=batch.theta_j_ids,
+        theta_weights=batch.theta_weights,
+    )
+    targets = AIRRTM_ModelTarget(
+        sequence_repertoire_indicators=torch.ones_like(batch.labels),
+        sequence_repertoire_labels=batch.labels,
+        sequences=batch.sequences,
+        repertoire_ids=batch.repertoire_ids,
+    )
+    loss = criterion(predictions, targets, tau=tau)
+    if not torch.isfinite(loss["total_loss"]):
+        raise RuntimeError(f"Non-finite loss: { {k: float(v) for k, v in loss.items()} }")
+    return loss
+
+
+def _make_batch(
+    *,
+    datasets: list[SequenceDataset],
+    probabilities: list[torch.Tensor | None],
+    repertoire_indices: torch.Tensor,
+    repertoire_labels: torch.Tensor,
+    n_sequences: int,
+    device: torch.device,
+    n_theta_sequences: int = 0,
+) -> Batch:
+    """Draw ``n_sequences`` per repertoire, plus an optional disjoint Theta sample.
+
+    Both draws come from one pass so they can be made disjoint: with uniform
+    sampling a single permutation is split in two, which guarantees no sequence is
+    both scored and used to infer its own repertoire's topic proportions.
+    """
+    scored = _Columns()
+    context = _Columns()
+    for repertoire_index in repertoire_indices.tolist():
+        dataset = datasets[repertoire_index]
+        indices, theta_indices = _sample_indices(
+            dataset.size(),
+            n_sequences,
+            probabilities[repertoire_index],
+            n_theta_sequences,
+        )
+        label = int(repertoire_labels[repertoire_index])
+        scored.add(dataset, indices, repertoire_index, label)
+        if n_theta_sequences:
+            context.add(dataset, theta_indices, repertoire_index, label)
+
+    return Batch(
+        sequences=scored.stack("data", device, torch.long),
+        repertoire_ids=scored.stack("ids", device),
+        labels=scored.stack("labels", device),
+        v_ids=scored.stack("v_ids", device),
+        j_ids=scored.stack("j_ids", device),
+        weights=scored.stack("weights", device),
+        theta_sequences=context.stack("data", device, torch.long),
+        theta_repertoire_ids=context.stack("ids", device),
+        theta_v_ids=context.stack("v_ids", device),
+        theta_j_ids=context.stack("j_ids", device),
+        theta_weights=context.stack("weights", device),
+    )
+
+
+class _Columns:
+    """Accumulates the per-repertoire slices that make up one batch."""
+
+    def __init__(self):
+        self.columns = {key: [] for key in ("data", "ids", "labels", "v_ids", "j_ids", "weights")}
+
+    def add(self, dataset: SequenceDataset, indices, repertoire_index: int, label: int):
+        n = indices.shape[0]
+        self.columns["data"].append(dataset.data[indices])
+        self.columns["ids"].append(torch.full((n,), repertoire_index, dtype=torch.long))
+        self.columns["labels"].append(torch.full((n,), label, dtype=torch.long))
+        if dataset.v_ids is not None:
+            self.columns["v_ids"].append(dataset.v_ids[indices])
+            self.columns["j_ids"].append(dataset.j_ids[indices])
+        if dataset.weights is not None:
+            self.columns["weights"].append(dataset.weights[indices])
+
+    def stack(self, key: str, device, dtype=None):
+        parts = self.columns[key]
+        if not parts:
+            return None
+        stacked = torch.concatenate(parts, dim=0)
+        return (stacked.to(dtype) if dtype is not None else stacked).to(device)
+
+
+def _sample_indices(
+    size: int,
+    n_sequences: int,
+    probabilities: torch.Tensor | None,
+    n_theta_sequences: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Draw sequence indices from one repertoire, plus an optional Theta sample.
+
+    Small and large repertoires contribute equally, so sampling is effectively with
+    replacement across epochs; when clonal abundances are available they set the
+    sampling weights, and expanded clones are drawn in proportion to their size.
+
+    With uniform sampling the two draws come from one permutation and are therefore
+    strictly disjoint. Abundance-weighted sampling draws them independently instead
+    (a shared clone may legitimately appear in both), which is enough to break the
+    self-reference: Theta is no longer a deterministic function of the scored batch.
+    """
+    total = n_sequences + n_theta_sequences
+    if probabilities is None:
+        if total <= size:
+            drawn = torch.randperm(size)[:total]
+        else:
+            drawn = torch.randint(low=0, high=size, size=(total,))
+        return drawn[:n_sequences], (drawn[n_sequences:] if n_theta_sequences else None)
+
+    drawn = torch.multinomial(probabilities, num_samples=total, replacement=True)
+    return drawn[:n_sequences], (drawn[n_sequences:] if n_theta_sequences else None)
+
+
+def _stratified_groups(
+    repertoire_labels: torch.Tensor,
+    n_repertoires_in_batch: int,
+    generator: torch.Generator | None = None,
+) -> list[torch.Tensor]:
+    """Partition the repertoires into groups holding both classes where possible.
+
+    A uniformly random group is single-class surprisingly often -- with 44% positives
+    and groups of 4, about 14% of the time (0.44^4 + 0.56^4). Such a step gives the
+    label term no contrast at all: every bag carries the same target, so the gradient
+    only shifts the bias.
+
+    Each group is seeded with one repertoire of each class, then filled from the
+    remaining pool. Simply interleaving the two classes is not enough -- whichever
+    class is larger ends up bunched at the tail, and the final groups are single-class
+    again.
+    """
+    labels = repertoire_labels.detach().cpu()
+    positive = torch.where(labels == 1)[0]
+    negative = torch.where(labels != 1)[0]
+    positive = positive[torch.randperm(positive.shape[0], generator=generator)]
+    negative = negative[torch.randperm(negative.shape[0], generator=generator)]
+
+    n_groups = labels.shape[0] // n_repertoires_in_batch
+    if n_groups == 0:
+        return []
+    # Seeding needs one of each class per group; with fewer, seed as many as we can.
+    n_seeded = min(n_groups, positive.shape[0], negative.shape[0])
+    groups: list[list[torch.Tensor]] = [[] for _ in range(n_groups)]
+    for k in range(n_seeded):
+        groups[k].append(positive[k])
+        groups[k].append(negative[k])
+
+    remaining = torch.cat([positive[n_seeded:], negative[n_seeded:]])
+    remaining = remaining[torch.randperm(remaining.shape[0], generator=generator)]
+    cursor = 0
+    for group in groups:
+        while len(group) < n_repertoires_in_batch and cursor < remaining.shape[0]:
+            group.append(remaining[cursor])
+            cursor += 1
+    return [
+        torch.stack(group)
+        for group in groups
+        if len(group) == n_repertoires_in_batch
     ]
-    other_repertoire_ids = torch.concatenate(other_repertoire_ids)
-    return other_repertoire_ids
+
+
+def _sampling_probabilities(
+    datasets: list[SequenceDataset], abundance_weighted: bool
+) -> list[torch.Tensor | None]:
+    if not abundance_weighted:
+        return [None] * len(datasets)
+    return [d.sampling_probabilities() for d in datasets]
+
+
+def _tau_schedule(
+    tau_start: float | None,
+    tau_end: float,
+    n_epochs: int,
+    anneal_epochs: int | None = None,
+) -> np.ndarray:
+    """Geometric ramp of the MIL pooling temperature, then hold at ``tau_end``.
+
+    ``anneal_epochs`` decouples the ramp from the run length. Spreading it over all
+    ``n_epochs`` means a long run spends most of its life at a low temperature: with
+    1 -> 10 over 200 epochs, tau is still 1.37 at epoch 27, which for bags of ~1e3
+    pools almost exactly like the mean.
+
+    Low tau first is still the right shape -- at initialisation the arg-max sequence
+    of a bag is effectively random, so a high temperature back-propagates through one
+    arbitrary sequence per bag -- but the ramp has to finish early enough to matter.
+    """
+    if tau_start is None or n_epochs < 2:
+        return np.full(max(n_epochs, 1), tau_end)
+    anneal_epochs = min(anneal_epochs or n_epochs, n_epochs)
+    ramp = np.exp(np.linspace(np.log(tau_start), np.log(tau_end), max(anneal_epochs, 2)))
+    if anneal_epochs >= n_epochs:
+        return ramp[:n_epochs]
+    return np.concatenate([ramp, np.full(n_epochs - anneal_epochs, tau_end)])
+
+
+def _loss_keys(criterion: CompositeLoss) -> list[str]:
+    if not criterion.return_individual_compotents:
+        return ["total_loss"]
+    return [
+        "total_loss",
+        "reconstruction_loss",
+        "reconstruction_accuracy",
+        "kl_divergence",
+        "tm_loss",
+        "label_loss",
+        "label_accuracy",
+        "topic_l1",
+        "theta_entropy",
+        "topic_usage_entropy",
+        "topic_decorrelation",
+        "predicted_witness_rate",
+    ]
