@@ -1,0 +1,75 @@
+model_config:
+  encoder_type: "transformer"
+  encoder_params:
+    max_sequence_length: null
+    alphabet_length: null
+    attention_dim: 64
+    attention_dim_head: 32
+    attention_heads: 8
+    depth: 4
+    use_positional_encodings: true
+    pooling: "mean_max"
+    mask_padding: true
+  decoder_type: "transformer"
+  decoder_params:
+    max_sequence_length: null
+    alphabet_length: null
+    attention_dim: 64
+    attention_dim_head: 32
+    attention_heads: 8
+    depth: 4
+    use_positional_encodings: true
+  airrtm_params:
+    n_repertoires: null
+    latent_dim: 64
+    n_topics_signal: 5
+    n_topics_nonsignal: 10
+    theta_mode: "amortized"
+    theta_pooling: "attention"
+    label_input: "repertoire"
+    # v1-style Theta: no softmax, a raw unconstrained score (archive/model.py:220-224).
+    theta_normalization: "none"
+
+data_config:
+  use_vj: false
+  abundance_weighted_sampling: false
+
+training_config:
+  log_dir_suffix: "logs"
+  device: "cuda:0"
+  seed: 239
+  n_epochs: 300
+  patience: 60
+  val_size: 0.1
+  learning_rate: 0.001
+  weight_decay: 0.0
+  lr_decay_gamma: null
+  grad_clip: 1.0
+  n_sequences_per_repertoire_in_batch: 8192
+  n_repertoires_in_batch: 4
+  min_repertoire_size: 8192
+  n_batches_per_repertoire: 4
+  n_batches_per_repertoire_val: 1
+  log_every: 20
+  checkpoint_every: 5
+  tau: 1.0
+  tau_start: 0.1
+  loss_config:
+    vae_coef: 0.005
+    reconstruction_loss_coef: 0.95
+    # v1-style TM likelihood: raw BCE on an unnormalised theta.phi dot product,
+    # with opposite-class-partner negatives (archive/model.py:252,
+    # archive/losses.py:19-26). Requires theta_is_normalized=False.
+    tm_likelihood_family: "raw_bce"
+    theta_is_normalized: false
+    tm_likelihood_coef: 0.99
+    positive_class_weight: 0.5
+    topic_l1_coef: 0.0
+    # v1 never actually used entropy/usage regularisation (dead code in
+    # archive/model.py) -- and they're meaningless for a raw, unnormalised Theta.
+    theta_entropy_coef: 0.0
+    topic_usage_coef: 0.0
+    topic_decorrelation_coef: 0.0
+    # v1's activity_regularizer on raw phi (archive/model.py:197,
+    # latent_space_to_topic_proportions_coef, default 0.001).
+    phi_l2_coef: 0.0

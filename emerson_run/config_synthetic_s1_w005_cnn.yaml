@@ -1,0 +1,77 @@
+model_config:
+  # Synthetic-collapse debug (FINDINGS.md): a single-layer CNN branch alongside the
+  # transformer, concatenated -- a different inductive bias (local, fixed-width
+  # filters) than self-attention, isolated against the original baseline recipe
+  # (n_repertoires_in_batch back to 4, tm_negative_mode back to "batch" -- neither
+  # of those two levers fixed the collapse, so this tests CNN alone rather than
+  # stacking on top of them).
+  encoder_type: "transformer_cnn"
+  encoder_params:
+    max_sequence_length: null   # filled in from the data
+    alphabet_length: null       # filled in from the data
+    attention_dim: 64
+    attention_dim_head: 32
+    attention_heads: 8
+    depth: 4
+    use_positional_encodings: true
+    pooling: "mean_max"
+    mask_padding: true
+    cnn_channels: 64
+    cnn_kernel_size: 5
+  decoder_type: "transformer"
+  decoder_params:
+    max_sequence_length: null
+    alphabet_length: null
+    attention_dim: 64
+    attention_dim_head: 32
+    attention_heads: 8
+    depth: 4
+    use_positional_encodings: true
+  airrtm_params:
+    n_repertoires: null         # filled in from the data
+    latent_dim: 64
+    # Small topic space on purpose: this dataset has one planted signal and no V/J
+    # nuisance structure, unlike Emerson. The point of this run is only to confirm
+    # the TM/label objective can escape its uniform baseline when the signal is
+    # clean -- not to tune topic count.
+    n_topics_signal: 5
+    n_topics_nonsignal: 10
+    theta_mode: "amortized"
+    theta_pooling: "attention"
+    label_input: "repertoire"
+
+data_config:
+  use_vj: false
+  abundance_weighted_sampling: false
+
+training_config:
+  log_dir_suffix: "logs"
+  device: "cuda:0"
+  seed: 239
+  n_epochs: 300
+  patience: 60
+  val_size: 0.1
+  learning_rate: 0.0003
+  weight_decay: 0.0
+  lr_decay_gamma: null
+  grad_clip: 1.0
+  n_sequences_per_repertoire_in_batch: 8192
+  n_repertoires_in_batch: 4
+  min_repertoire_size: 8192
+  n_batches_per_repertoire: 4
+  n_batches_per_repertoire_val: 1
+  log_every: 20
+  checkpoint_every: 5
+  tau: 1.0
+  tau_start: 0.1
+  loss_config:
+    vae_coef: 0.05
+    reconstruction_loss_coef: 0.95
+    tm_likelihood_coef: 0.7
+    positive_class_weight: 0.5
+    topic_l1_coef: 0.0
+    theta_entropy_coef: 0.5
+    topic_usage_coef: 5.0
+    topic_usage_momentum: 0.9
+    topic_decorrelation_coef: 0.0
+    tm_max_negatives: null

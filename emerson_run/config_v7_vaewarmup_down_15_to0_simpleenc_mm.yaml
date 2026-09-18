@@ -1,0 +1,71 @@
+model_config:
+  encoder_type: "transformer"
+  encoder_params:
+    max_sequence_length: null   # filled in from the data
+    alphabet_length: null       # filled in from the data
+    attention_dim: 64
+    attention_dim_head: 32      # x_transformers wants >= 32 for rotary embeddings
+    attention_heads: 2
+    depth: 4
+    use_positional_encodings: true
+    # "mean_max" pools over positions with the padding mask applied, so the latent
+    # no longer depends on where in the padded window a residue happens to sit.
+    pooling: "mean_max"
+    mask_padding: true
+  decoder_type: "transformer"
+  decoder_params:
+    max_sequence_length: null
+    alphabet_length: null
+    attention_dim: 64
+    attention_dim_head: 32
+    attention_heads: 2
+    depth: 4
+    use_positional_encodings: true
+  airrtm_params:
+    n_repertoires: null         # filled in from the data
+    latent_dim: 64
+    n_topics_signal: 10
+    n_topics_nonsignal: 20
+    theta_mode: "amortized"
+    theta_pooling: "attention"
+    label_input: "repertoire"
+    vj_embedding_dim: 16
+
+data_config:
+  use_vj: true
+  abundance_weighted_sampling: true
+
+training_config:
+  log_dir_suffix: "logs"
+  device: "cuda:0"
+  seed: 239
+  n_epochs: 300
+  patience: 60
+  val_size: 0.1
+  learning_rate: 0.0003
+  weight_decay: 0.0
+  lr_decay_gamma: null
+  grad_clip: 1.0
+  n_sequences_per_repertoire_in_batch: 8192
+  n_repertoires_in_batch: 4
+  min_repertoire_size: 32768
+  n_batches_per_repertoire: 4
+  n_batches_per_repertoire_val: 1
+  log_every: 20
+  checkpoint_every: 5
+  tau: 1.0
+  tau_start: 0.1
+  # down, 15-epoch window, full range to 0.0 -- VAE permanently dropped after warmup.
+  vae_coef_start: 1.0
+  vae_anneal_epochs: 15
+  loss_config:
+    vae_coef: 0.0
+    reconstruction_loss_coef: 0.95
+    tm_likelihood_coef: 0.7
+    positive_class_weight: 0.5
+    topic_l1_coef: 0.0
+    theta_entropy_coef: 0.5
+    topic_usage_coef: 5.0
+    topic_usage_momentum: 0.9
+    topic_decorrelation_coef: 0.0
+    tm_max_negatives: null

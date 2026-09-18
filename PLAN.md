@@ -1,5 +1,80 @@
 # AIRRTM v2 on Emerson: restore true topic modeling + fix blocking defects
 
+## 2026-09-07 — new machine, next 24-48h
+
+Fresh GPU box (8x H100 80GB, no prior venv). Everything below "Implementation status"
+is now historical — all listed defects are fixed and merged (commit `143ab60` / `d713a2c`,
+55 tests passing) and `airrtm_model.py`/`composite_loss.py` already expose
+`theta_pooling`, `label_input`, `theta_entropy_coef`, `topic_usage_coef` as config knobs.
+`FINDINGS.md` (from the previous A100 machine) is the up-to-date empirical log — read that
+first, this section only says what changes on *this* machine and what's running now.
+
+**Environment**: `poetry` is not installed here; used `python3 -m venv .venv && pip install -e .`
+instead (torch 2.14+cu130, sees all 8 GPUs). `/Warehouse/Andrei/emerson/` has
+`processed_data_vj/` (748 metadata rows, matches FINDINGS.md) but no `raw_data/` and no
+prior current-code checkpoints — only one old pickled-`nn.Module` run
+(`model/per_rep_logsumexp_..._rep_4_seq_2048/`, 800+ epoch checkpoints) that predates this
+code and per `PLAN.md` original guidance should be **retrained, not converted**.
+`emerson_run/.env` was missing (gitignored) and `CONFIG_PATH` in `.env.example` pointed at
+a `/home/as/...` path from the old machine — recreated `.env` with this machine's paths.
+
+**Decisions for this run, and why:**
+1. Skip re-deriving whether the TM objective is sound on Emerson before checking it on
+   synthetic data — FINDINGS.md's own "what to do next" says this control is missing and is
+   "highest value, cheap". Cloned `csi-greifflab/airrtm_data`, unzipped `S1` (single-signal)
+   at witness rates 0.005 and 0.001, and `S2` (poly-signal) at 0.001, into
+   `/Warehouse/Andrei/synthetic/`. Preprocessed with `--max_len 20 --min_len 6` (paper's
+   settings for this data, not Emerson's 26). Training queued once preprocessing lands
+   (~2.5-3h/dataset on this CPU, ran in parallel).
+2. Launched three Emerson runs immediately (GPUs 0-2) rather than waiting on synthetic
+   validation first, since each takes many hours and the synthetic check cannot fail fast
+   enough to gate them without wasting a day of idle H100s:
+   - `emerson_run/config_v7.yaml` (GPU 0, `model/v7_attn_dualentropy/`) — FINDINGS.md's
+     recommended next run: `theta_pooling: attention`, `label_input: repertoire`, bag size
+     raised from the shipped default (1024) to 8192/repertoire (finding: 1024 leaves most
+     CMV+ bags with no signal clonotype), both entropy terms together
+     (`theta_entropy_coef: 0.5`, `topic_usage_coef: 1.0`), `tm_likelihood_coef: 0.7`.
+   - `emerson_run/config_v7_wide_topics.yaml` (GPU 1) — same, but 60 topics (20 signal + 40
+     non-signal) instead of 30, testing finding 5's "bottleneck may be too narrow" note.
+   - `emerson_run/config_ablation_meanpool.yaml` (GPU 2) — same bag size and entropy coefs
+     as v7, but `theta_pooling: mean` / `label_input: sequence`. Control: isolates whether
+     attention pooling itself is still load-bearing in this codebase (as opposed to the
+     larger bag or the entropy terms), since nothing on *this* machine has confirmed that
+     yet — the old machine's finding used a different commit.
+   All three smoke-tested clean on a 12-repertoire slice before the full launch (no crash,
+   `rec_acc` rising off the pad floor). Full runs confirmed alive at ~70-72GB/GPU, 100%
+   util, `n_epochs: 200, patience: 25` — expect low tens of hours each, not all 200 epochs.
+
+**Deferred, not started this session** (next priorities per `FINDINGS.md`, in order):
+restrict the TM likelihood to public clonotypes (needs a preprocessing/data-loader change,
+not just a config flag — do this once the synthetic control and v7 report back, not blind);
+evaluate whichever of the three above finishes first, or is killed by early stopping, against
+the 151-repertoire test split and the 0.781 burden-score baseline (no run on this machine has
+been evaluated yet, unlike the old machine where v4/v5 checkpoints existed unevaluated);
+generation, still blocked on signal topics meaning something.
+
+**Update, same session — a real bug found and fixed, GPU allocation changed to 7 runs + 1 eval.**
+All six runs above collapsed identically (`H_theta` and `H_usage` both to ~0 by epoch 0-4,
+Emerson and synthetic alike) because `composite_loss.py::_topic_usage`'s EMA only passes
+gradient through its `(1-momentum)` branch, making the shipped `topic_usage_coef: 1.0` an
+effective 0.1 — five times weaker than `theta_entropy_coef`, not two times stronger as the
+config's own comment intended. Full account, the failed naive fix, and the chosen value
+(`topic_usage_coef: 5.0`, unconfirmed past a small smoke test) are in `FINDINGS.md`'s
+"same day" update — read that before touching this coefficient again. All six runs were killed
+and relaunched with the fix, plus a seventh (`v7_tmheavy`, GPU 6, `tm_likelihood_coef: 0.85`) to
+use all 8 GPUs minus one reserved for `evaluate-model`. Launching 4 Emerson jobs at once also
+hit a separate CPU-thread-thrashing stall (each spawns ~168 OMP threads); fixed with
+`OMP_NUM_THREADS=16 MKL_NUM_THREADS=16` on relaunch, worth doing by default for >2-3 concurrent
+jobs on this box.
+
+**To pick this back up**: check `model/*.log` (nohup, no tmux) and `nvidia-smi`. All seven
+training processes were launched with `nohup ... & disown`, independent of any interactive
+session. Kill specific PIDs (`ps aux | grep train-model`) if these should be superseded rather
+than left to finish — avoid a blanket `pkill -f train-model`, which needs explicit confirmation
+here.
+
+---
+
 ## Implementation status
 
 Everything in Parts 1–3 below is **implemented and unit-tested**; no training run has been
