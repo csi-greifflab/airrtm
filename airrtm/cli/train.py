@@ -96,6 +96,15 @@ def main():
         tau=training_config.get("tau", 1.0),
         tau_start=training_config.get("tau_start"),
         tau_anneal_epochs=training_config.get("tau_anneal_epochs"),
+        tm_likelihood_coef_start=training_config.get("tm_likelihood_coef_start"),
+        theta_entropy_coef_start=training_config.get("theta_entropy_coef_start"),
+        topic_usage_coef_start=training_config.get("topic_usage_coef_start"),
+        coef_anneal_epochs=training_config.get("coef_anneal_epochs"),
+        vae_coef_start=training_config.get("vae_coef_start"),
+        reconstruction_loss_coef_start=training_config.get(
+            "reconstruction_loss_coef_start"
+        ),
+        vae_anneal_epochs=training_config.get("vae_anneal_epochs"),
         abundance_weighted_sampling=data_config.get(
             "abundance_weighted_sampling", True
         ),

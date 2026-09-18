@@ -135,6 +135,16 @@ def signal_enrichment(
 
     An enrichment of 1.0 is chance; the witness rate itself is the baseline
     precision, so this is the scale-free version of ``precision_at_k``.
+
+    ``roc_auc`` is invariant to class balance, so at a witness rate this low (often
+    1-in-10,000 or rarer) it barely moves even when the ranking is fairly informative
+    or fairly bad -- most of the comparisons it aggregates over are signal-vs-signal or
+    noise-vs-noise pairs far from the decision-relevant region. ``pr_auc`` (average
+    precision) is chance-calibrated to ``witness_rate`` instead of 0.5, so it is the
+    metric to read first at this imbalance; ``roc_auc`` is kept for continuity with
+    ``classify_repertoires`` and because it is still meaningful together with the
+    per-fraction ``enrichment@`` values below, which say exactly where in the ranking
+    the signal concentrates.
     """
     scores = np.asarray(scores)
     is_signal = np.asarray(is_signal, dtype=bool)
@@ -145,6 +155,8 @@ def signal_enrichment(
     if witness_rate <= 0:
         return report
     report["roc_auc"] = float(roc_auc_score(is_signal, scores))
+    report["pr_auc"] = float(average_precision_score(is_signal, scores))
+    report["pr_auc_over_chance"] = report["pr_auc"] / float(witness_rate)
     for fraction in top_fractions:
         k = max(int(round(fraction * len(scores))), 1)
         precision = float(ranked[:k].mean())

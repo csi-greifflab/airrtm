@@ -29,12 +29,41 @@ LOSS_KEY_TO_PRINT = {
     "theta_entropy": "H_theta",
     "topic_usage_entropy": "H_usage",
     "topic_decorrelation": "decorr",
+    "phi_l2": "phi_l2",
     "predicted_witness_rate": "wr",
 }
 
 #: Repertoires smaller than this are sampled with replacement, so that every
 #: repertoire contributes the same number of sequences per epoch regardless of size.
 DEFAULT_MIN_REPERTOIRE_SIZE = 32768
+
+
+def _tm_random_baseline(
+    n_repertoires_in_batch: int,
+    n_sequences_per_repertoire_in_batch: int,
+    tm_max_negatives: int | None,
+    tm_likelihood_family: str = "batch_softmax",
+) -> float:
+    """Expected ``tm_loss`` with a completely uninformative theta/phi.
+
+    ``tm_likelihood_family="batch_softmax"``: ``tm_loss`` is a softmax negative
+    log-likelihood over the batch's sequences (``CompositeLoss._tm_loss``): with no
+    real signal, every candidate scores about equally, so the loss sits at
+    ``log(N)`` for ``N`` candidates -- not ``-log(0.5)``, which is the *label*
+    loss's chance value, not this one. ``tm_loss`` barely moves off this ceiling
+    even when the TM branch is doing real work (on the order of 1e-2 to 1e-3 nats),
+    which is why ``tm_gain`` below rescales the gap rather than the raw loss.
+
+    ``tm_likelihood_family="raw_bce"``: ``tm_loss`` is a plain binary
+    cross-entropy (``CompositeLoss._tm_loss_raw_bce``), not a softmax over a
+    candidate pool -- its chance value *is* ``-log(0.5)``, same as the label loss.
+    """
+    if tm_likelihood_family == "raw_bce":
+        return float(np.log(2.0))
+    pool_size = n_repertoires_in_batch * n_sequences_per_repertoire_in_batch
+    if tm_max_negatives is not None:
+        pool_size = min(pool_size, tm_max_negatives)
+    return float(np.log(pool_size))
 
 
 @dataclass
@@ -78,6 +107,13 @@ def train_model(
     tau: float = 1.0,
     tau_start: float | None = None,
     tau_anneal_epochs: int | None = None,
+    tm_likelihood_coef_start: float | None = None,
+    theta_entropy_coef_start: float | None = None,
+    topic_usage_coef_start: float | None = None,
+    coef_anneal_epochs: int | None = None,
+    vae_coef_start: float | None = None,
+    reconstruction_loss_coef_start: float | None = None,
+    vae_anneal_epochs: int | None = None,
     abundance_weighted_sampling: bool = True,
     grad_clip: float | None = None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
@@ -87,6 +123,7 @@ def train_model(
     checkpoint_dir: pl.Path | None = None,
     checkpoint_every: int = 1,
     keep_best_model: bool = True,
+    tm_gain_scale: float = 100.0,
 ) -> dict[str, list[dict[str, float]]]:
     """Train an AIRRTM model with repertoire mini-batching.
 
@@ -101,6 +138,44 @@ def train_model(
     ``tau_start`` to ``tau`` across epochs: a low temperature pools towards the mean
     (a stable but weak signal), a high one towards the max (sharp, but easy to get
     stuck on a single sequence).
+
+    ``tm_likelihood_coef_start``, ``theta_entropy_coef_start`` and
+    ``topic_usage_coef_start`` optionally ramp those three ``criterion`` coefficients
+    linearly from their ``_start`` value to the value already set on ``criterion``,
+    over ``coef_anneal_epochs`` (default: the whole run). Unlike ``tau``'s geometric
+    ramp, this one is linear so it can start at exactly 0.0 (entropy/usage) or end at
+    exactly 1.0 (tm_likelihood_coef, which correspondingly drives
+    ``criterion.label_likelihood_coef`` to ``1 - tm_likelihood_coef`` each epoch, same
+    as ``CompositeLoss.__init__``). Intended for warm-starting the TM likelihood
+    before the label loss and entropy regularisers compete for the same shared
+    encoder/Theta: set ``tm_likelihood_coef_start=1.0`` and the entropy/usage starts
+    to ``0.0`` to give TM an unopposed window, then anneal down/up to the run's real
+    target coefficients.
+
+    ``vae_coef_start`` and ``reconstruction_loss_coef_start`` are the same idea one
+    level up: they ramp ``criterion.vae_coef`` and ``criterion.reconstruction_loss_coef``
+    (with ``criterion.kld_coef`` kept as ``1 - reconstruction_loss_coef`` each epoch,
+    same as ``CompositeLoss.__init__``) over ``vae_anneal_epochs`` (default:
+    ``coef_anneal_epochs``, so one window covers everything unless a separate one is
+    wanted). ``vae_coef`` gates the *entire* non-VAE branch
+    (``total = vae_coef * VAE + (1 - vae_coef) * non_vae``), so either direction is a
+    real, distinct experiment, unlike the TM-vs-label warm start above, which only
+    reshuffles weight *within* the non-VAE branch:
+
+    - ``vae_coef_start`` near ``0.0`` (ramping *up* to the run's real, usually small,
+      target) gives TM/label/entropy an unopposed window with literally zero VAE
+      gradient reaching the shared encoder at all, regardless of ``vae_coef``'s
+      target -- the same regime as the standalone "unopposed TM" diagnostic
+      (``theta_mode="free"``, everything but ``tm_likelihood_coef`` zeroed,
+      ``vae_coef=0.0`` throughout), except VAE fades back in afterward instead of
+      staying off for the whole run.
+    - ``vae_coef_start`` near ``1.0`` (ramping *down*) is the opposite: the model
+      spends its first epochs as a plain sequence autoencoder, and topic modelling
+      and classification are only attached once VAE's weight has faded down.
+
+    Pair either with ``reconstruction_loss_coef_start`` near ``1.0`` for classic KL
+    annealing (near-zero KL weight at first, to avoid posterior collapse while the
+    encoder is still finding a useful representation) on top.
     """
     device = device or torch.tensor(0.0).device
 
@@ -148,6 +223,17 @@ def train_model(
         f"{n_sequences_per_repertoire_in_batch} sequences = "
         f"{n_repertoires_in_batch * n_sequences_per_repertoire_in_batch} sequences"
     )
+    tm_random_baseline = _tm_random_baseline(
+        n_repertoires_in_batch,
+        n_sequences_per_repertoire_in_batch,
+        criterion.tm_max_negatives,
+        criterion.tm_likelihood_family,
+    )
+    if model.use_topic_model:
+        print(
+            f"tm_loss random baseline: {tm_random_baseline:.4f} nats "
+            f"(tm_gain = (baseline - tm_loss) * {tm_gain_scale:g})"
+        )
     if n_theta_sequences_per_repertoire:
         print(
             f"theta inferred from a disjoint sample of "
@@ -171,10 +257,36 @@ def train_model(
     history = {"train": [], "val": []}
 
     taus = _tau_schedule(tau_start, tau, n_epochs, tau_anneal_epochs)
+    tm_coefs = _linear_schedule(
+        tm_likelihood_coef_start, criterion.tm_likelihood_coef, n_epochs, coef_anneal_epochs
+    )
+    entropy_coefs = _linear_schedule(
+        theta_entropy_coef_start, criterion.theta_entropy_coef, n_epochs, coef_anneal_epochs
+    )
+    usage_coefs = _linear_schedule(
+        topic_usage_coef_start, criterion.topic_usage_coef, n_epochs, coef_anneal_epochs
+    )
+    vae_anneal_epochs = vae_anneal_epochs if vae_anneal_epochs is not None else coef_anneal_epochs
+    vae_coefs = _linear_schedule(
+        vae_coef_start, criterion.vae_coef, n_epochs, vae_anneal_epochs
+    )
+    rec_coefs = _linear_schedule(
+        reconstruction_loss_coef_start,
+        criterion.reconstruction_loss_coef,
+        n_epochs,
+        vae_anneal_epochs,
+    )
     global_step = 0
     recent = {key: 0.0 for key in loss_keys}
     for epoch in range(n_epochs):
         epoch_tau = taus[epoch]
+        criterion.tm_likelihood_coef = float(tm_coefs[epoch])
+        criterion.label_likelihood_coef = 1.0 - float(tm_coefs[epoch])
+        criterion.theta_entropy_coef = float(entropy_coefs[epoch])
+        criterion.topic_usage_coef = float(usage_coefs[epoch])
+        criterion.vae_coef = float(vae_coefs[epoch])
+        criterion.reconstruction_loss_coef = float(rec_coefs[epoch])
+        criterion.kld_coef = 1.0 - float(rec_coefs[epoch])
         model.train()
         running = {key: 0.0 for key in loss_keys}
         n_steps = 0
@@ -218,6 +330,13 @@ def train_model(
                             writer.add_scalars(
                                 key, {"Train": recent[key] / log_every}, global_step
                             )
+                        if model.use_topic_model:
+                            recent_tm_gain = (
+                                tm_random_baseline - recent["tm_loss"] / log_every
+                            ) * tm_gain_scale
+                            writer.add_scalars(
+                                "tm_gain", {"Train": recent_tm_gain}, global_step
+                            )
                         writer.add_scalar("tau", epoch_tau, global_step)
                         recent = {key: 0.0 for key in loss_keys}
                 pbar.set_postfix(
@@ -227,6 +346,10 @@ def train_model(
                     }
                 )
         train_metrics = {key: running[key] / max(n_steps, 1) for key in loss_keys}
+        if model.use_topic_model:
+            train_metrics["tm_gain"] = (
+                tm_random_baseline - train_metrics["tm_loss"]
+            ) * tm_gain_scale
         history["train"].append(train_metrics)
 
         val_metrics = evaluate(
@@ -243,12 +366,20 @@ def train_model(
             loss_keys=loss_keys,
             n_theta_sequences_per_repertoire=n_theta_sequences_per_repertoire,
         )
+        if model.use_topic_model:
+            val_metrics["tm_gain"] = (
+                tm_random_baseline - val_metrics["tm_loss"]
+            ) * tm_gain_scale
         history["val"].append(val_metrics)
 
         if writer is not None:
             # Same x-axis as the per-step curves above, so Train and Val overlay.
             for key in loss_keys:
                 writer.add_scalars(key, {"Val": val_metrics[key]}, global_step)
+            if model.use_topic_model:
+                writer.add_scalars(
+                    "tm_gain", {"Val": val_metrics["tm_gain"]}, global_step
+                )
             writer.add_scalar("epoch", epoch, global_step)
 
         print(
@@ -256,6 +387,7 @@ def train_model(
             + " ".join(
                 f"{LOSS_KEY_TO_PRINT.get(k, k)}={val_metrics[k]:.4f}" for k in loss_keys
             )
+            + (f" tm_gain={val_metrics['tm_gain']:.4f}" if model.use_topic_model else "")
         )
 
         if scheduler is not None:
@@ -354,6 +486,7 @@ def _step(
         sequence_repertoire_labels=batch.labels,
         sequences=batch.sequences,
         repertoire_ids=batch.repertoire_ids,
+        weights=batch.weights,
     )
     loss = criterion(predictions, targets, tau=tau)
     if not torch.isfinite(loss["total_loss"]):
@@ -542,6 +675,29 @@ def _tau_schedule(
     return np.concatenate([ramp, np.full(n_epochs - anneal_epochs, tau_end)])
 
 
+def _linear_schedule(
+    start: float | None,
+    end: float,
+    n_epochs: int,
+    anneal_epochs: int | None = None,
+) -> np.ndarray:
+    """Linear ramp from ``start`` to ``end``, then hold at ``end``.
+
+    Same shape as ``_tau_schedule``, but linear rather than geometric so it can
+    start at exactly 0.0 or end at exactly 1.0 -- both routine for the loss
+    coefficients this schedules (``theta_entropy_coef``/``topic_usage_coef`` start
+    at 0, ``tm_likelihood_coef`` can end at 1), where a log-space ramp would be
+    undefined.
+    """
+    if start is None or n_epochs < 2:
+        return np.full(max(n_epochs, 1), end)
+    anneal_epochs = min(anneal_epochs or n_epochs, n_epochs)
+    ramp = np.linspace(start, end, max(anneal_epochs, 2))
+    if anneal_epochs >= n_epochs:
+        return ramp[:n_epochs]
+    return np.concatenate([ramp, np.full(n_epochs - anneal_epochs, end)])
+
+
 def _loss_keys(criterion: CompositeLoss) -> list[str]:
     if not criterion.return_individual_compotents:
         return ["total_loss"]
@@ -557,5 +713,6 @@ def _loss_keys(criterion: CompositeLoss) -> list[str]:
         "theta_entropy",
         "topic_usage_entropy",
         "topic_decorrelation",
+        "phi_l2",
         "predicted_witness_rate",
     ]

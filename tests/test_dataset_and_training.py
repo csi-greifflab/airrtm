@@ -2,7 +2,12 @@ import pytest
 import torch
 
 from airrtm.models import model_factory
-from airrtm.training.train import _make_batch, _sampling_probabilities, train_model
+from airrtm.training.train import (
+    _linear_schedule,
+    _make_batch,
+    _sampling_probabilities,
+    train_model,
+)
 from airrtm.utils import SequenceDataset, check_consistent_max_length, split_sequences
 
 from conftest import MAX_LENGTH, make_dataset, make_model_config
@@ -131,6 +136,63 @@ def test_train_model_smoke(tmp_path, criterion, alphabet_length):
     assert all(torch.isfinite(torch.tensor(m["total_loss"])) for m in history["train"])
     assert not torch.equal(before, model.z_mean_layer.weight)
     assert list((tmp_path / "checkpoints").glob("checkpoint_epoch_*.pt"))
+
+
+def test_linear_schedule_ramps_then_holds():
+    schedule = _linear_schedule(start=1.0, end=0.05, n_epochs=6, anneal_epochs=3)
+    assert schedule.shape == (6,)
+    assert schedule[0] == pytest.approx(1.0)
+    assert schedule[2] == pytest.approx(0.05)
+    # Held at `end` for every epoch past the anneal window.
+    assert schedule[2:] == pytest.approx(0.05)
+    # Monotonically ramping down towards `end` within the window.
+    assert list(schedule[:3]) == sorted(schedule[:3], reverse=True)
+
+
+def test_linear_schedule_no_start_holds_at_end():
+    """``start=None`` is how every coefficient behaves without an explicit warm
+    start -- constant at the run's real target from epoch 0."""
+    schedule = _linear_schedule(start=None, end=0.7, n_epochs=4)
+    assert schedule == pytest.approx([0.7, 0.7, 0.7, 0.7])
+
+
+def test_train_model_applies_vae_warm_start(tmp_path, criterion, alphabet_length):
+    """vae_coef_start/reconstruction_loss_coef_start must actually reach the
+    criterion's built-in target by the end of the anneal window, not just be
+    accepted and ignored."""
+    n_repertoires = 4
+    datasets = [make_dataset(60, with_extras=True) for _ in range(n_repertoires)]
+    train, val = split_sequences(datasets, val_size=0.2)
+    labels = torch.tensor([1, 0, 1, 0])
+
+    model = model_factory(**make_model_config(n_repertoires, alphabet_length))
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    target_vae_coef = criterion.vae_coef
+    target_rec_coef = criterion.reconstruction_loss_coef
+    train_model(
+        model=model,
+        sequence_datasets_train=train,
+        sequence_datasets_val=val,
+        repertoire_labels=labels,
+        criterion=criterion,
+        optimizer=optimizer,
+        n_epochs=2,
+        patience=10,
+        n_sequences_per_repertoire_in_batch=5,
+        n_repertoires_in_batch=2,
+        min_repertoire_size=16,
+        tau=1.0,
+        vae_coef_start=0.95,
+        reconstruction_loss_coef_start=0.99,
+        vae_anneal_epochs=2,
+        checkpoint_dir=tmp_path / "checkpoints",
+        log_dir=None,
+    )
+    # anneal_epochs == n_epochs, so the last epoch lands exactly on the target.
+    assert criterion.vae_coef == pytest.approx(target_vae_coef)
+    assert criterion.reconstruction_loss_coef == pytest.approx(target_rec_coef)
+    assert criterion.kld_coef == pytest.approx(1 - target_rec_coef)
 
 
 def test_optimizer_gradients_do_not_accumulate_across_steps(

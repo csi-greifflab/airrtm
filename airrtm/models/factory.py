@@ -2,10 +2,14 @@ import inspect
 
 from airrtm.models.airrtm_model import AIRRTM_Model
 from airrtm.models.decoder import LSTMDecoder, TransformerDecoder
-from airrtm.models.encoder import LSTMEncoder, TransformerEncoder
+from airrtm.models.encoder import LSTMEncoder, TransformerCNNEncoder, TransformerEncoder
 
 
-ENCODERS = {"transformer": TransformerEncoder, "lstm": LSTMEncoder}
+ENCODERS = {
+    "transformer": TransformerEncoder,
+    "lstm": LSTMEncoder,
+    "transformer_cnn": TransformerCNNEncoder,
+}
 DECODERS = {"transformer": TransformerDecoder, "lstm": LSTMDecoder}
 
 

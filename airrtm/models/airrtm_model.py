@@ -36,6 +36,20 @@ THETA_POOLINGS = ("mean", "attention")
 #:   unseen repertoire, so that combination is rejected.
 LABEL_INPUTS = ("sequence", "repertoire")
 
+#: How the repertoire topic logits are turned into Theta.
+#:
+#: - ``"softmax"``: log-softmax over topics, so Theta is a proper probability
+#:   distribution per repertoire. What every run in this codebase has used so far.
+#: - ``"none"``: no normalisation at all -- Theta is the raw, unconstrained logit
+#:   row, exactly the original v1 behaviour (``archive/model.py:220-224``, where the
+#:   softmax is present in the code but commented out). Pairs with
+#:   ``CompositeLoss(tm_likelihood_family="raw_bce")``, which is the only TM
+#:   likelihood that knows how to score an unnormalised Theta; using this mode with
+#:   ``tm_likelihood_family="batch_softmax"`` (or with ``theta_entropy_coef`` /
+#:   ``topic_usage_coef`` nonzero, which assume a probability simplex) is not
+#:   meaningful.
+THETA_NORMALIZATIONS = ("softmax", "none")
+
 
 class AIRRTM_Model(torch.nn.Module):
     """
@@ -58,12 +72,17 @@ class AIRRTM_Model(torch.nn.Module):
         encoder: torch.nn.Module,
         decoder: torch.nn.Module,
         theta_mode: str = "amortized",
+        theta_normalization: str = "softmax",
         theta_pooling: str = "mean",
+        theta_pooling_weights: bool = True,
+        theta_pooling_weight_power: float = 1.0,
+        topic_input_from_mean: bool = False,
         label_input: str = "sequence",
         attention_hidden_dim: int = 64,
         n_v_genes: int = 0,
         n_j_genes: int = 0,
         vj_embedding_dim: int = 8,
+        use_topic_model: bool = True,
     ):
         super().__init__()
 
@@ -78,6 +97,13 @@ class AIRRTM_Model(torch.nn.Module):
                 f"Unsupported theta_mode {theta_mode}, expected one of {THETA_MODES}"
             )
         self.theta_mode = theta_mode
+
+        if theta_normalization not in THETA_NORMALIZATIONS:
+            raise ValueError(
+                f"Unsupported theta_normalization {theta_normalization}, expected "
+                f"one of {THETA_NORMALIZATIONS}"
+            )
+        self.theta_normalization = theta_normalization
 
         self.encoder = encoder
         self.decoder = decoder
@@ -101,6 +127,38 @@ class AIRRTM_Model(torch.nn.Module):
                 f"{THETA_POOLINGS}"
             )
         self.theta_pooling = theta_pooling
+        # Clonal abundance is already applied once, in the batch sampler
+        # (``abundance_weighted_sampling``), which draws indices proportional to
+        # ``duplicate_count``. Letting it back in here -- as ``+log(count)`` inside
+        # the attention logits, or as a multiplicative weight in the grouped mean --
+        # applies it a second time, so the effective pooling weight on a clonotype
+        # goes as ``count**2`` and Theta's effective sample size collapses to a
+        # couple of dozen clonotypes per repertoire. Set False to pool over the
+        # drawn sequences unweighted, which is also what the Fisher burden
+        # baseline does (it scores distinct clonotypes, abundance ignored).
+        self.theta_pooling_weights = theta_pooling_weights
+        # Exponent applied to the clonal abundances before they enter the pooling.
+        # The sampler already draws proportional to count, so the *total* weight a
+        # clonotype carries in Theta goes as count**(1 + theta_pooling_weight_power):
+        # power 1.0 (the default, and what every run before 2026-09-16 used) means
+        # count**2; power 0.0 is equivalent to theta_pooling_weights=False. Held-out
+        # AUC falls off sharply as the total exponent drops (count**2 -> 0.725,
+        # count -> 0.59, uniform -> 0.56 across paired seeds), so this is exposed to
+        # sweep *upward* rather than to switch off.
+        self.theta_pooling_weight_power = theta_pooling_weight_power
+        # Which latent the topic branch reads. False (the default, and what every run
+        # before 2026-09-17 used) feeds phi and Theta the reparameterised *sample*
+        # z_SL; True feeds the posterior mean z_mean_SL instead.
+        #
+        # Two reasons to prefer the mean. (1) It removes the sampling noise from
+        # Theta, which is pooled over a bag and then read by a Linear(n_signal -> 1)
+        # label head -- noise there is pure variance, not regularisation. (2) It
+        # removes a train/eval mismatch that has been present all along: every
+        # inference path (predict_topic_logits, infer_repertoire_topic_proportions,
+        # and the disjoint theta-context branch of forward) already reads z_mean,
+        # while training reads a sample. The decoder and the KL still use the sample,
+        # so the VAE is unchanged.
+        self.topic_input_from_mean = topic_input_from_mean
         if label_input not in LABEL_INPUTS:
             raise ValueError(
                 f"Unsupported label_input {label_input}, expected one of {LABEL_INPUTS}"
@@ -111,6 +169,13 @@ class AIRRTM_Model(torch.nn.Module):
                 "the label head reads a free per-repertoire embedding, which memorises "
                 "training labels and cannot score an unseen repertoire"
             )
+        if not use_topic_model and label_input != "repertoire":
+            raise ValueError(
+                "use_topic_model=False drops phi (the per-sequence topic-logit layer) "
+                "entirely, so label_input='sequence' -- which reads phi -- has nothing "
+                "to read. Use label_input='repertoire' (reads Theta directly)."
+            )
+        self.use_topic_model = use_topic_model
         self.label_input = label_input
         if self.theta_mode in ("amortized", "both"):
             if theta_pooling == "attention":
@@ -140,11 +205,12 @@ class AIRRTM_Model(torch.nn.Module):
             bias=True,
         )
 
-        self.latent_space_to_topic_proportions_layer = torch.nn.Linear(
-            in_features=self._topic_input_dim(),
-            out_features=self.n_topics,
-            bias=True,
-        )
+        if self.use_topic_model:
+            self.latent_space_to_topic_proportions_layer = torch.nn.Linear(
+                in_features=self._topic_input_dim(),
+                out_features=self.n_topics,
+                bias=True,
+            )
         self.repertoire_label_prediction_layer = torch.nn.Linear(
             in_features=self.n_topics_signal,
             out_features=1,
@@ -186,9 +252,17 @@ class AIRRTM_Model(torch.nn.Module):
             / self.latent_dim
         )
 
-        topic_input_ST = self._with_vj(z_SL, v_ids, j_ids)
-        seq_topic_logits_ST = self.latent_space_to_topic_proportions_layer(topic_input_ST)
-        seq_topic_probabilities_ST = torch.sigmoid(seq_topic_logits_ST)
+        # getattr for checkpoints pickled before this attribute existed.
+        topic_latent_SL = (
+            z_mean_SL if getattr(self, "topic_input_from_mean", False) else z_SL
+        )
+        topic_input_ST = self._with_vj(topic_latent_SL, v_ids, j_ids)
+        if self.use_topic_model:
+            seq_topic_logits_ST = self.latent_space_to_topic_proportions_layer(topic_input_ST)
+            seq_topic_probabilities_ST = torch.sigmoid(seq_topic_logits_ST)
+        else:
+            seq_topic_logits_ST = None
+            seq_topic_probabilities_ST = None
 
         theta_context = None
         if theta_sequences is not None:
@@ -206,24 +280,46 @@ class AIRRTM_Model(torch.nn.Module):
             weights=weights,
             context=theta_context,
         )
-        # Unnormalised log score of observing this sequence in its own repertoire:
-        #   log sum_t theta_rt * phi_ts   with   phi_ts = exp(seq_topic_logits_ts).
-        # The loss turns this into a normalised likelihood by dividing through a
-        # partition function estimated over the sequences in the batch.
-        tm_log_scores_S = torch.logsumexp(
-            log_topic_proportions_ST + seq_topic_logits_ST, dim=1
-        )
-        # Kept for backwards compatibility and for reporting: the original bounded
-        # "likelihood" sum_t theta_rt * sigmoid(phi_ts), which lies in (0, 1).
-        tm_likelihoods_S = (
-            torch.exp(log_topic_proportions_ST) * seq_topic_probabilities_ST
-        ).sum(dim=1)
+        if self.use_topic_model:
+            if self.theta_normalization == "softmax":
+                # Unnormalised log score of observing this sequence in its own
+                # repertoire: log sum_t theta_rt * phi_ts, phi_ts = exp(seq_topic_logits_ts).
+                # The loss turns this into a normalised likelihood by dividing through
+                # a partition function estimated over the sequences in the batch.
+                tm_log_scores_S = torch.logsumexp(
+                    log_topic_proportions_ST + seq_topic_logits_ST, dim=1
+                )
+                # Kept for backwards compatibility and for reporting: the original
+                # bounded "likelihood" sum_t theta_rt * sigmoid(phi_ts), in (0, 1).
+                tm_likelihoods_S = (
+                    torch.exp(log_topic_proportions_ST) * seq_topic_probabilities_ST
+                ).sum(dim=1)
+            else:
+                # v1-style (archive/model.py:252): a raw, unnormalised dot product
+                # between raw theta and raw phi logits -- not a log-likelihood
+                # despite the field name. CompositeLoss(tm_likelihood_family=
+                # "raw_bce") clips this into (0, 1) and scores it with a plain BCE
+                # against an explicit positive (own repertoire) / negative
+                # (opposite-class partner) target.
+                tm_log_scores_S = (log_topic_proportions_ST * seq_topic_logits_ST).sum(
+                    dim=1
+                )
+                tm_likelihoods_S = tm_log_scores_S
+        else:
+            tm_log_scores_S = None
+            tm_likelihoods_S = None
 
         if self.label_input == "repertoire":
             # Theta is constant within a repertoire, so this broadcasts one logit per
             # repertoire across its sequences; the MIL pooling in the loss then reduces
             # to the identity and the bag prediction is exactly this value.
-            label_features_ST = torch.exp(log_topic_proportions_ST)
+            label_features_ST = (
+                torch.exp(log_topic_proportions_ST)
+                if self.theta_normalization == "softmax"
+                # v1 (archive/model.py:263) feeds raw theta straight into the label
+                # head with no exponential -- there is no probability to exponentiate.
+                else log_topic_proportions_ST
+            )
         else:
             label_features_ST = seq_topic_probabilities_ST
         seq_label_prediction_S = self.repertoire_label_prediction_layer(
@@ -299,7 +395,7 @@ class AIRRTM_Model(torch.nn.Module):
             logits_RT, _, inverse_S = self.repertoire_topic_logits(
                 repertoire_ids, topic_input_ST, weights
             )
-            return torch.log_softmax(logits_RT, dim=1)[inverse_S]
+            return self._normalize_theta(logits_RT)[inverse_S]
 
         context_input_ST, context_ids, context_weights = context
         logits_RT, unique_ids_R, _ = self.repertoire_topic_logits(
@@ -318,7 +414,15 @@ class AIRRTM_Model(torch.nn.Module):
             raise ValueError(
                 "Every scored repertoire must also appear in the Theta context sample"
             )
-        return torch.log_softmax(logits_RT, dim=1)[rows_S]
+        return self._normalize_theta(logits_RT)[rows_S]
+
+    def _normalize_theta(self, logits_RT: torch.Tensor) -> torch.Tensor:
+        if self.theta_normalization == "softmax":
+            return torch.log_softmax(logits_RT, dim=1)
+        # "none": raw, unconstrained logits -- v1's behaviour (archive/model.py:223,
+        # softmax present in the code but commented out). Despite living in the
+        # "log_topic_proportions" field, this is not a log-probability.
+        return logits_RT
 
     def repertoire_topic_logits(
         self,
@@ -356,6 +460,12 @@ class AIRRTM_Model(torch.nn.Module):
         weights_S: torch.Tensor | None,
     ) -> torch.Tensor:
         """Collapse a repertoire's sequences into one topic-logit vector."""
+        # getattr for checkpoints pickled before these attributes existed.
+        if not getattr(self, "theta_pooling_weights", True):
+            weights_S = None
+        power = getattr(self, "theta_pooling_weight_power", 1.0)
+        if weights_S is not None and power != 1.0:
+            weights_S = weights_S.clamp(min=EPS) ** power
         if self.theta_pooling == "attention":
             log_weights_S = (
                 None if weights_S is None else torch.log(weights_S.clamp(min=EPS))
@@ -406,6 +516,31 @@ class AIRRTM_Model(torch.nn.Module):
 
     # ---------------------------------------------------------------- inference
 
+    def predict_topic_logits(
+        self,
+        x_sequence_SP: torch.Tensor,
+        v_ids: torch.Tensor | None = None,
+        j_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Raw per-sequence topic logits ``phi``, before any squashing.
+
+        These are the quantity the TM likelihood actually uses -- ``exp(phi_ts)``
+        plays the role of an unnormalised ``p(s | t)`` in
+        ``log p(s|r) = logsumexp_t(log theta_rt + phi_ts)``. ``predict_topic_
+        probabilities`` squashes them with a sigmoid for the scoring/reporting path,
+        which is a different scale and not usable for topic-posterior arithmetic.
+        """
+        if not self.use_topic_model:
+            raise ValueError(
+                "use_topic_model=False dropped phi (the per-sequence topic-logit "
+                "layer) entirely -- there is no per-sequence topic logit to predict. "
+                "Use theta_features (topic_proportion_features) instead, which reads "
+                "Theta and does not depend on phi."
+            )
+        z_mean_SL = self.sequence_to_latent(x_sequence_SP)
+        topic_input_ST = self._with_vj(z_mean_SL, v_ids, j_ids)
+        return self.latent_space_to_topic_proportions_layer(topic_input_ST)
+
     def predict_topic_probabilities(
         self,
         x_sequence_SP: torch.Tensor,
@@ -413,11 +548,7 @@ class AIRRTM_Model(torch.nn.Module):
         j_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Per-sequence topic probabilities, on the same scale used during training."""
-        z_mean_SL = self.sequence_to_latent(x_sequence_SP)
-        topic_input_ST = self._with_vj(z_mean_SL, v_ids, j_ids)
-        return torch.sigmoid(
-            self.latent_space_to_topic_proportions_layer(topic_input_ST)
-        )
+        return torch.sigmoid(self.predict_topic_logits(x_sequence_SP, v_ids, j_ids))
 
     def predict_label_logits(
         self,

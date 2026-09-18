@@ -335,6 +335,42 @@ def test_label_input_repertoire_gives_one_prediction_per_repertoire(alphabet_len
     assert distinct.std() > 0
 
 
+def test_use_topic_model_false_drops_phi(alphabet_length):
+    config = _attention_config(alphabet_length)
+    config["airrtm_params"]["label_input"] = "repertoire"
+    config["airrtm_params"]["use_topic_model"] = False
+    model = model_factory(**config)
+    assert not hasattr(model, "latent_space_to_topic_proportions_layer")
+
+    sequences, repertoire_ids, _ = make_batch(alphabet_length=alphabet_length)
+    output = model(repertoire_ids, sequences)
+    assert output["seq_topic_logits"] is None
+    assert output["seq_topic_probabilities"] is None
+    assert output["tm_log_scores"] is None
+    assert output["tm_likelihoods"] is None
+    # Theta and the label branch still work -- that's the whole point.
+    assert output["log_topic_proportions"].shape == (sequences.shape[0], model.n_topics)
+    assert torch.isfinite(output["label_likelihoods"]).all()
+
+
+def test_use_topic_model_false_rejects_label_input_sequence(alphabet_length):
+    config = make_model_config(2, alphabet_length)
+    config["airrtm_params"]["use_topic_model"] = False
+    # label_input defaults to "sequence", which reads phi -- incompatible.
+    with pytest.raises(ValueError, match="use_topic_model=False"):
+        model_factory(**config)
+
+
+def test_use_topic_model_false_predict_topic_probabilities_raises(alphabet_length):
+    config = _attention_config(alphabet_length)
+    config["airrtm_params"]["label_input"] = "repertoire"
+    config["airrtm_params"]["use_topic_model"] = False
+    model = model_factory(**config)
+    sequences, _, _ = make_batch(alphabet_length=alphabet_length)
+    with pytest.raises(ValueError, match="use_topic_model=False"):
+        model.predict_topic_probabilities(sequences)
+
+
 def test_label_input_repertoire_rejects_free_theta(alphabet_length):
     """That combination is the v1 memorisation shortcut."""
     config = make_model_config(2, alphabet_length)
@@ -342,3 +378,253 @@ def test_label_input_repertoire_rejects_free_theta(alphabet_length):
     config["airrtm_params"]["label_input"] = "repertoire"
     with pytest.raises(ValueError, match="v1 shortcut"):
         model_factory(**config)
+
+
+def test_rejects_unknown_theta_normalization(alphabet_length):
+    config = make_model_config(2, alphabet_length)
+    config["airrtm_params"]["theta_normalization"] = "nonsense"
+    with pytest.raises(ValueError, match="theta_normalization"):
+        model_factory(**config)
+
+
+def test_theta_normalization_none_leaves_theta_unnormalized(alphabet_length):
+    """v1 (archive/model.py:220-224) never applies the commented-out softmax --
+    Theta is the raw, unconstrained logit row. Confirm rows need not sum to 1 and
+    need not be non-positive, unlike the default softmax mode."""
+    config = _attention_config(alphabet_length)
+    config["airrtm_params"]["theta_normalization"] = "none"
+    model = model_factory(**config)
+    sequences, repertoire_ids, _ = make_batch(alphabet_length=alphabet_length)
+    output = model(repertoire_ids, sequences)
+    theta_raw = output["log_topic_proportions"]
+    # A raw linear/attention-pooled logit row has no reason to sum to 1 or stay
+    # non-positive -- if this ever starts passing by coincidence, tighten it.
+    assert not torch.allclose(
+        theta_raw.exp().sum(dim=1), torch.ones(sequences.shape[0]), atol=1e-3
+    )
+    # Still constant within a repertoire, same as the softmax-normalised mode.
+    for repertoire in repertoire_ids.unique():
+        rows = theta_raw[repertoire_ids == repertoire]
+        assert torch.allclose(rows, rows[0].expand_as(rows), atol=1e-5)
+
+
+def test_theta_normalization_none_tm_log_scores_is_raw_dot_product(alphabet_length):
+    config = make_model_config(2, alphabet_length)
+    config["airrtm_params"]["theta_normalization"] = "none"
+    model = model_factory(**config)
+    sequences, repertoire_ids, _ = make_batch(alphabet_length=alphabet_length)
+    output = model(repertoire_ids, sequences)
+    expected = (output["log_topic_proportions"] * output["seq_topic_logits"]).sum(dim=1)
+    assert torch.allclose(output["tm_log_scores"], expected, atol=1e-5)
+    assert torch.allclose(output["tm_likelihoods"], expected, atol=1e-5)
+
+
+def test_theta_normalization_none_label_features_are_raw(alphabet_length):
+    """label_input="repertoire" must read raw Theta directly in this mode -- there
+    is no probability to exponentiate (archive/model.py:263)."""
+    config = _attention_config(alphabet_length)
+    config["airrtm_params"]["theta_normalization"] = "none"
+    config["airrtm_params"]["label_input"] = "repertoire"
+    model = model_factory(**config)
+    sequences, repertoire_ids, _ = make_batch(alphabet_length=alphabet_length)
+    with torch.no_grad():
+        output = model(repertoire_ids, sequences)
+        expected = model.repertoire_label_prediction_layer(
+            output["log_topic_proportions"][:, : model.n_topics_signal]
+        ).flatten()
+    assert torch.allclose(output["label_likelihoods"], expected, atol=1e-5)
+
+
+# ------------------------------------------ theta_pooling_weights (experiment 1)
+
+
+def test_theta_pooling_weights_false_ignores_clonal_abundance(alphabet_length):
+    """Abundance must not reach Theta's pooling when the flag is off.
+
+    With it on, one expanded clone dominates the pooled Theta (and, since the
+    sampler already draws proportional to the same counts, abundance would be
+    applied twice). With it off, Theta is a plain pool over the drawn sequences.
+    """
+    sequences, repertoire_ids, _ = make_batch(alphabet_length=alphabet_length)
+    weights = torch.ones(sequences.shape[0])
+    weights[0] = 1000.0
+
+    for pooling in ("mean", "attention"):
+        config = make_model_config(4, alphabet_length)
+        config["airrtm_params"]["theta_pooling"] = pooling
+        config["airrtm_params"]["theta_pooling_weights"] = False
+
+        torch.manual_seed(0)
+        model = model_factory(**config)
+        model.eval()
+        # z is a reparameterised sample, which eval() does not disable, so the
+        # seed has to be reset between the two passes for them to be comparable.
+        with torch.no_grad():
+            torch.manual_seed(1)
+            skewed = model(repertoire_ids, sequences, weights=weights)
+            torch.manual_seed(1)
+            flat = model(repertoire_ids, sequences, weights=torch.ones_like(weights))
+        assert torch.allclose(
+            skewed["log_topic_proportions"], flat["log_topic_proportions"], atol=1e-6
+        ), pooling
+
+
+def test_theta_pooling_weights_true_still_uses_clonal_abundance(alphabet_length):
+    sequences, repertoire_ids, _ = make_batch(alphabet_length=alphabet_length)
+    weights = torch.ones(sequences.shape[0])
+    weights[0] = 1000.0
+
+    config = make_model_config(4, alphabet_length)
+    config["airrtm_params"]["theta_pooling"] = "attention"
+    config["airrtm_params"]["theta_pooling_weights"] = True
+
+    torch.manual_seed(0)
+    model = model_factory(**config)
+    model.eval()
+    with torch.no_grad():
+        torch.manual_seed(1)
+        skewed = model(repertoire_ids, sequences, weights=weights)
+        torch.manual_seed(1)
+        flat = model(repertoire_ids, sequences, weights=torch.ones_like(weights))
+    assert not torch.allclose(
+        skewed["log_topic_proportions"], flat["log_topic_proportions"], atol=1e-6
+    )
+
+
+def test_theta_pooling_weight_power_zero_matches_disabling_weights(alphabet_length):
+    """power=0 flattens the abundances, so it must equal theta_pooling_weights=False."""
+    sequences, repertoire_ids, _ = make_batch(alphabet_length=alphabet_length)
+    weights = torch.randint(1, 500, (sequences.shape[0],)).float()
+
+    def theta(power=None, use_weights=True):
+        config = make_model_config(4, alphabet_length)
+        config["airrtm_params"]["theta_pooling"] = "attention"
+        config["airrtm_params"]["theta_pooling_weights"] = use_weights
+        if power is not None:
+            config["airrtm_params"]["theta_pooling_weight_power"] = power
+        torch.manual_seed(0)
+        model = model_factory(**config)
+        model.eval()
+        with torch.no_grad():
+            torch.manual_seed(1)
+            return model(repertoire_ids, sequences, weights=weights)["log_topic_proportions"]
+
+    assert torch.allclose(theta(power=0.0), theta(use_weights=False), atol=1e-5)
+    # power=1.0 is the shipped default and must leave behaviour untouched.
+    assert torch.allclose(theta(power=1.0), theta(), atol=1e-6)
+    # A higher power concentrates Theta further onto the largest clones.
+    assert not torch.allclose(theta(power=2.0), theta(power=1.0), atol=1e-6)
+
+
+# ------------------------------------------------- fold-in Theta (one EM E-step)
+
+
+def test_fold_in_topic_proportions_returns_a_simplex_for_a_free_theta_model(
+    alphabet_length,
+):
+    """The whole point: a free-Theta model can now place an UNSEEN repertoire."""
+    from airrtm.evaluation.scoring import fold_in_topic_proportions
+    from conftest import N_TOPICS_NONSIGNAL, N_TOPICS_SIGNAL, make_dataset
+
+    config = make_model_config(4, alphabet_length, theta_mode="free")
+    model = model_factory(**config)
+    model.eval()
+    dataset = make_dataset(n=40)
+
+    theta = fold_in_topic_proportions(model, dataset, n_sequences=32, n_repeats=2)
+    n_topics = N_TOPICS_SIGNAL + N_TOPICS_NONSIGNAL
+    assert theta.shape == (n_topics,)
+    assert torch.all(theta >= 0)
+    assert float(theta.sum()) == pytest.approx(1.0, abs=1e-5)
+    # The amortized path is unavailable for this model -- that is why fold-in exists.
+    with pytest.raises(ValueError, match="free"):
+        model.infer_repertoire_topic_proportions(dataset.data[:8].to(torch.long))
+
+
+def test_fold_in_matches_the_hand_computed_e_step(alphabet_length):
+    """theta_t is proportional to the summed per-sequence topic posteriors.
+
+    Uses a single-sequence repertoire so the draw is deterministic whatever the
+    sampler does; the E-step then has to reduce to exactly softmax_t(phi).
+    """
+    from airrtm.evaluation.scoring import fold_in_topic_proportions
+    from conftest import make_dataset
+
+    model = model_factory(**make_model_config(4, alphabet_length, theta_mode="free"))
+    model.eval()
+    dataset = make_dataset(n=1)
+
+    theta = fold_in_topic_proportions(model, dataset, n_sequences=1, n_repeats=1)
+    with torch.no_grad():
+        phi = model.predict_topic_logits(dataset.data.to(torch.long))
+        expected = torch.softmax(phi, dim=1).flatten()
+    assert torch.allclose(theta, expected, atol=1e-5)
+
+
+def test_topic_proportion_features_auto_routes_by_theta_mode(alphabet_length):
+    from airrtm.evaluation.scoring import topic_proportion_features
+    from conftest import N_TOPICS_NONSIGNAL, N_TOPICS_SIGNAL, make_dataset
+
+    datasets = [make_dataset(n=24), make_dataset(n=24)]
+    free = model_factory(**make_model_config(2, alphabet_length, theta_mode="free"))
+    free.eval()
+    features = topic_proportion_features(
+        free, datasets, show_progress=False, n_sequences=16, n_repeats=1
+    )
+    assert features.shape == (2, N_TOPICS_SIGNAL + N_TOPICS_NONSIGNAL)
+
+    amortized = model_factory(**make_model_config(2, alphabet_length))
+    amortized.eval()
+    assert topic_proportion_features(
+        amortized, datasets, show_progress=False, n_sequences=16, n_repeats=1
+    ).shape == (2, N_TOPICS_SIGNAL + N_TOPICS_NONSIGNAL)
+
+
+# --------------------------------------------- topic_input_from_mean (Stage 3)
+
+
+def test_topic_input_from_mean_makes_the_topic_branch_deterministic(alphabet_length):
+    """phi/Theta stop carrying the reparameterisation noise; the VAE keeps it."""
+    sequences, repertoire_ids, _ = make_batch(alphabet_length=alphabet_length)
+
+    def run(from_mean, seed):
+        config = make_model_config(4, alphabet_length)
+        config["airrtm_params"]["theta_pooling"] = "attention"
+        config["airrtm_params"]["topic_input_from_mean"] = from_mean
+        torch.manual_seed(0)
+        model = model_factory(**config)
+        model.eval()
+        with torch.no_grad():
+            torch.manual_seed(seed)
+            return model(repertoire_ids, sequences)
+
+    # Different reparameterisation draws must leave the topic branch untouched...
+    a, b = run(True, 1), run(True, 2)
+    assert torch.allclose(a["seq_topic_logits"], b["seq_topic_logits"], atol=1e-6)
+    assert torch.allclose(
+        a["log_topic_proportions"], b["log_topic_proportions"], atol=1e-6
+    )
+    # ...while the decoder still sees the sample, so the VAE is unchanged.
+    assert not torch.allclose(a["decoded_sequences"], b["decoded_sequences"], atol=1e-6)
+
+    # And the default (sampling) behaviour is untouched.
+    c, d = run(False, 1), run(False, 2)
+    assert not torch.allclose(c["seq_topic_logits"], d["seq_topic_logits"], atol=1e-6)
+
+
+def test_topic_input_from_mean_matches_the_inference_path(alphabet_length):
+    """The flag removes a standing train/eval mismatch.
+
+    predict_topic_logits has always read z_mean. With the flag on, training reads the
+    same thing, so the phi a checkpoint is evaluated with is the phi it was fit with.
+    """
+    sequences, repertoire_ids, _ = make_batch(alphabet_length=alphabet_length)
+    config = make_model_config(4, alphabet_length)
+    config["airrtm_params"]["topic_input_from_mean"] = True
+    torch.manual_seed(0)
+    model = model_factory(**config)
+    model.eval()
+    with torch.no_grad():
+        trained_path = model(repertoire_ids, sequences)["seq_topic_logits"]
+        inference_path = model.predict_topic_logits(sequences)
+    assert torch.allclose(trained_path, inference_path, atol=1e-6)

@@ -83,35 +83,53 @@ def main():
     }
 
     # --- per-sequence scores -> repertoire quantile features -----------------
-    score_kwargs = dict(
-        batch_size=args.batch_size, device=device, method=args.score_method
-    )
-    if args.score_method == "topic_weights":
-        score_kwargs["repertoire_labels"] = labels_train.to(device)
-        if model.theta_mode != "free":
-            score_kwargs["repertoire_topic_proportions_RT"] = torch.tensor(
-                topic_proportion_features(model, datasets_train), device=device
-            )
+    # Needs phi (the per-sequence topic-logit layer), which use_topic_model=False
+    # drops entirely -- skip rather than crash, same style as the theta_mode='free'
+    # skip below.
+    scores_test = None
+    if model.use_topic_model:
+        score_kwargs = dict(
+            batch_size=args.batch_size, device=device, method=args.score_method
+        )
+        if args.score_method == "topic_weights":
+            score_kwargs["repertoire_labels"] = labels_train.to(device)
+            if model.theta_mode != "free":
+                score_kwargs["repertoire_topic_proportions_RT"] = torch.tensor(
+                    topic_proportion_features(model, datasets_train), device=device
+                )
 
-    scores_train = score_repertoires(model, datasets_train, **score_kwargs)
-    scores_test = score_repertoires(model, datasets_test, **score_kwargs)
+        scores_train = score_repertoires(model, datasets_train, **score_kwargs)
+        scores_test = score_repertoires(model, datasets_test, **score_kwargs)
 
-    features_train = repertoire_features(scores_train)
-    features_test = repertoire_features(scores_test)
-    report["quantile_features"] = classify_repertoires(
-        features_train, labels_train_np, features_test, labels_test_np
-    )
-    report["quantile_features_cv"] = cross_validated_report(
-        np.concatenate([features_train, features_test]),
-        np.concatenate([labels_train_np, labels_test_np]),
-    )
+        features_train = repertoire_features(scores_train)
+        features_test = repertoire_features(scores_test)
+        report["quantile_features"] = classify_repertoires(
+            features_train, labels_train_np, features_test, labels_test_np
+        )
+        report["quantile_features_cv"] = cross_validated_report(
+            np.concatenate([features_train, features_test]),
+            np.concatenate([labels_train_np, labels_test_np]),
+        )
+    else:
+        report["quantile_features"] = (
+            "skipped: use_topic_model=False dropped phi, no per-sequence score exists"
+        )
+        report["quantile_features_cv"] = report["quantile_features"]
 
-    # --- topic proportions as features (needs an amortized theta) ------------
-    if model.theta_mode != "free":
+    # --- topic proportions as features ---------------------------------------
+    # theta_mode="free" has no amortized head, so held-out repertoires used to be
+    # skipped here entirely. topic_proportion_features now folds them in instead
+    # (one EM E-step over frozen phi), which puts free-Theta runs on the same
+    # feature space, classifier and baseline as the amortized ones.
+    if True:
         theta_train = topic_proportion_features(model, datasets_train)
         theta_test = topic_proportion_features(model, datasets_test)
         report["theta_features"] = classify_repertoires(
             theta_train, labels_train_np, theta_test, labels_test_np
+        )
+        report["theta_features_cv"] = cross_validated_report(
+            np.concatenate([theta_train, theta_test]),
+            np.concatenate([labels_train_np, labels_test_np]),
         )
         separation = topic_separation(
             np.concatenate([theta_train, theta_test]),
@@ -125,6 +143,7 @@ def main():
         report["theta_features"] = (
             "skipped: theta_mode='free' has no proportions for unseen repertoires"
         )
+        report["theta_features_cv"] = report["theta_features"]
 
     # --- baseline ------------------------------------------------------------
     if not args.skip_baseline:
@@ -136,18 +155,20 @@ def main():
         )
         report["burden_n_selected"] = int(len(baseline.selected_keys_))
 
-    # --- what the topics contain --------------------------------------------
-    top_by_topic = top_sequences_per_topic(
-        model, datasets_train[0], n_top=args.n_top_sequences, device=device
-    )
-    pd.concat(
-        [frame.assign(topic=topic) for topic, frame in top_by_topic.items()]
-    ).to_csv(output_dir / "top_sequences_per_topic.csv", index=False)
+    # --- what the topics contain (needs phi) ---------------------------------
+    if model.use_topic_model:
+        top_by_topic = top_sequences_per_topic(
+            model, datasets_train[0], n_top=args.n_top_sequences, device=device
+        )
+        pd.concat(
+            [frame.assign(topic=topic) for topic, frame in top_by_topic.items()]
+        ).to_csv(output_dir / "top_sequences_per_topic.csv", index=False)
 
-    # --- top-ranked candidate sequences --------------------------------------
-    _write_top_candidates(
-        datasets_test, scores_test, metadata_test, output_dir, n_top=1000
-    )
+    # --- top-ranked candidate sequences (needs phi) --------------------------
+    if scores_test is not None:
+        _write_top_candidates(
+            datasets_test, scores_test, metadata_test, output_dir, n_top=1000
+        )
 
     with open(output_dir / "report.json", "w") as otp:
         json.dump(report, otp, indent=2, default=str)
