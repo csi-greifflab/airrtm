@@ -3445,3 +3445,346 @@ sample, so **every checkpoint in this project has been evaluated with a differen
 than it was fit with**. The depth-1 arm deliberately changes two things at once and is
 recorded as exploratory; note `x_transformers` sets `unet_skips=(depth>1)`, so depth 1
 silently disables those too.
+
+## 2026-09-18: a new best classifier, a sequence-attribution result on the pathway this document had been reading wrong, and the constant learning rate in every config
+
+### 1. `normloss_tm03_nowarm` -- 0.7904, the best repertoire AUC in the project
+
+The untested cross: **no warm-start** *and* **`tm_likelihood_coef: 0.3`**. Neither
+original arm had both.
+
+| epoch | 10 | 15 | 20 | 25 | 30 | 35 | **40** | 45 | 50 | 55 | 60 | 65 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| AUC | .754 | .771 | .762 | .751 | .755 | .748 | **.7904** | .771 | .770 | .758 | .755 | .763 |
+
+Twelve consecutive checkpoints above 0.74, peak **0.7904** at epoch 40, **margin +0.106**
+over its 0.684 bar -- the widest in the project by a third, and the first result here to
+clear 0.78. It decays to 0.66-0.73 after epoch 80. Fisher is 0.874, so the gap is now
+0.084, down from 0.134 at the start of this work.
+
+**What the winning checkpoint looks like inside:**
+
+| epoch | 0 | 19 | 29 | **39** | 49 | 69 | 89 | 109 |
+|---|---|---|---|---|---|---|---|---|
+| `tm` | 10.3993 | 10.3954 | 10.3954 | **10.3953** | 10.3956 | 10.3957 | 10.3963 | 10.3959 |
+| `rec_acc` | 0.357 | 0.363 | 0.369 | **0.468** | 0.474 | 0.584 | 0.639 | 0.662 |
+| `label` | 0.3444 | 0.3265 | 0.3369 | **0.3555** | 0.3897 | 0.4529 | 0.5225 | 0.5929 |
+
+At the AUC peak the TM is **at chance** (gain 0.0019 nats) and reconstruction is a
+mediocre 0.468 -- and `rec_acc` then climbs to 0.66 *while held-out AUC decays from 0.79
+to 0.70*. The best result this project has produced is achieved with both generative
+components inert. That is the clearest statement yet of the outcome PLAN_v5 flagged as
+possible: on Emerson this behaves as a supervised MIL classifier, and the machinery it is
+named for is along for the ride.
+
+Three replicates (`seed{1,2,3}`, 80 epochs, `checkpoint_every: 2`) were launched and have
+now finished; their curves are pending (see section 7).
+
+### 2. Four curves that closed threads, all negative
+
+| run | best | bar | margin | verdict |
+|---|---|---|---|---|
+| `normloss_nowarm_long` (200ep) | 0.7583 | 0.684 | +0.074 | **worse than its own 60-epoch run (0.7666)** -- "still rising at ep58" was noise |
+| `normloss_nowarm_zmean` | 0.7519 | 0.684 | +0.068 | no help |
+| `normloss_tm03_zmean` | 0.7620 | 0.684 | +0.078 | vs 0.7623 without -- identical |
+| `tm10x` (200ep) | 0.6756 | 0.6633 | +0.012 | at its untrained floor for the whole run |
+| `rangeloss_depth1_seed1` | 0.7269 | 0.6633 | +0.064 | replicates seed239's +0.091; mean **+0.078** |
+| `rangeloss_depth1_wide` | 0.7223 | 0.6659 | +0.056 | **peak is epoch 0** -- the widening failed |
+
+Two conclusions worth keeping:
+
+- **`topic_input_from_mean` (Stage 3) is a null on peak AUC**, twice over. It still fixes
+  a real train/eval mismatch and is worth keeping on principle, but it buys nothing
+  measurable. Its variance-reduction claim is untested against these curves.
+- **Long budgets were the wrong call.** Extending the leader from 60 to 200 epochs made it
+  worse. Subsequent runs use 80 epochs with `checkpoint_every: 2`.
+
+`tm10x` is also a warning about reading training metrics: it had the best label loss of
+anything here (0.3418, below chance at epoch 200) and the best reconstruction ever
+recorded (0.95), and neither translated into held-out AUC.
+
+### 3. The sequence-attribution comparison was being run through the wrong layer
+
+The three PR-AUC measurements made earlier in the day (on `tm03_nowarm` ep40, `tm10x`
+ep195 and `rangeloss_depth1` ep45) all used `label_head` and `topic_weights` -- both of
+which read **phi**. The 166x result in this document was measured on a **different
+pathway**, `attention x value` from `TopicAttentionPooling`, which the new script did not
+implement. Any comparison against 166x that does not name the pathway is meaningless.
+
+`analysis/sequence_attribution.py` (committed today; the previous version of this check
+lived in an uncommitted scratch file) now scores all three readouts. The
+`attention_value` reconstruction follows `TopicAttentionPooling.forward` exactly:
+
+```
+values_ST = pooling.value(h)
+gated     = tanh(pooling.attend(h)) * sigmoid(pooling.gate(h))
+attention = _grouped_softmax(pooling.score(gated), ..., log_weights)
+score_s   = sum_{t < n_signal} attention[s,t] * values[s,t]
+```
+
+Two details that matter: the softmax is **over sequences within a repertoire**, so the
+whole repertoire is normalised together (batching covers only the encoder forward), and
+**clonal abundance enters the attention logits** as in training, including
+`theta_pooling_weight_power`.
+
+**Reference validation.** `warmstart_full_medium`'s `model.pt` -- the exact checkpoint
+that scored 16.9x -- re-scored through this implementation:
+
+| fraction | this implementation | the original figure in this document |
+|---|---|---|
+| 1e-5 | 61.7x | 166x |
+| 1e-4 | 30.8x | 66x |
+| 1e-3 | 20.3x | 43x |
+| 1e-2 | 4.0x | 6.1x |
+| 1e-1 | 1.31x | 1.4x |
+| `pr_auc_over_chance` | **3.564x** | 16.9x |
+
+The **shape reproduces exactly** -- smooth monotone decay from the extreme top to ~1.3 at
+10%, the signature this document called genuine ranking signal rather than a lucky spike
+-- but the magnitudes are 2-3x lower, converging at the coarse end. The likely cause is a
+different ground-truth set: this scoring has **1,625 signal sequences at witness rate
+1.18e-4**, where the historical check reports **603** over the same ~13.7M candidates,
+probably the CDR3-only 482-clonotype list versus the V/J-aware 528. Enrichment is
+normalised by witness rate, so a 2.7x difference in the denominator moves everything.
+
+**Consequence: today's absolute PR-AUC numbers are not comparable to the historical ones,
+but they are internally consistent** -- every scoring below used the identical ground
+truth and the same 70 positive test repertoires.
+
+### 4. `usage_lower1` scores 14.13x on phi -- the best sequence attribution here
+
+All scorings on the same ground truth, `pr_auc_over_chance`:
+
+| checkpoint | test AUC | `tm_gain` (nats) | `rec_acc` | `label_head` (phi) | `topic_weights` (phi) | `attention x value` |
+|---|---|---|---|---|---|---|
+| **`usage_lower1`** `model.pt` | 0.704 | **0.0130** | -- | **14.13** | **6.35** | 0.94 |
+| `warmstart_full_medium` `model.pt` | 0.740 | -0.0088 | 0.444 | 0.86 | 0.90 | **3.56** |
+| `rangeloss_depth1` ep45 | 0.754 | 0.0001 | **0.689** | 1.04 | 1.09 | 2.58 |
+| `warmstart_full_medium` ep50 | 0.666 | -0.0088 | 0.444 | 1.00 | 1.08 | 2.01 |
+| `normloss_tm03_nowarm` ep40 | **0.790** | 0.0023 | 0.468 | 0.99 | 0.89 | 1.43 |
+| `warmstart_usage3_seed2` `model.pt` | 0.708 | 0.0119 | -- | 1.08 | 1.17 | 0.79 |
+
+`usage_lower1`'s **`enrichment@1e-5` is 308x on both phi readouts: 5 true signal
+clonotypes in the top 137 of ~13.7M sequences**, against 0.016 expected by chance
+(Poisson p ~ 1e-9). That is the largest sequence-attribution effect recorded in this
+project, ~4x the `warmstart_full_medium` reference on identical ground truth.
+
+This **falsifies a claim made repeatedly in this document and earlier today**: that phi
+has never beaten ~1.1x on any checkpoint. It was true of everything tested until now.
+And on this checkpoint the *attention* pathway is the dead one (0.94x) -- exactly inverted
+from `warmstart_full_medium`, where phi is dead and attention carries the signal.
+
+Three caveats, all load-bearing:
+
+1. **`warmstart_usage3_seed2` has near-identical TM gain (0.0119) and classifier AUC
+   (0.708) and shows nothing on any pathway.** So TM gain alone does not predict
+   attribution; n=2 and the two disagree. The same pattern held historically -- 166x
+   reproduced on 2 of 3 seeds.
+2. **`usage_lower1` is a fully collapsed run** (`H_theta` ~ 0.0001), which sits awkwardly
+   with "a functioning Theta helps". A collapsed topic model produced the best attribution.
+3. The Fisher list is a p-value threshold on exact clonotype identity, not ground truth.
+
+**Withdrawn on the same day it was proposed:** "per-sequence PR-AUC tracks reconstruction
+quality". It was a monotone ordering across three phi-readout points, and both the
+pathway correction and the reference validation killed it -- the best sequence-ranker
+(`warmstart_full_medium`, 3.56x) has one of the worst VAEs (0.444). Nothing currently
+explains the ordering; every checkpoint differs in several ways at once.
+
+What does survive: **good repertoire classification and good sequence attribution still do
+not co-occur in any single checkpoint.** The best classifier (0.790) is the worst
+attributor among scorable checkpoints (1.43x on its best pathway).
+
+### 5. Every run in this project has trained at a constant 3e-4
+
+Asked whether `rangeloss_depth1`'s loss curve indicated a step-size problem. It does not
+-- it indicates overfitting:
+
+| epoch | 0 | 12 | 24 | **36** | 48 | 60 | 84 | 102 | 120 |
+|---|---|---|---|---|---|---|---|---|---|
+| val `total` | 5.234 | 2.211 | 1.722 | **1.404** | 1.514 | 1.546 | 1.548 | 1.676 | 1.827 |
+
+Validation bottoms at epoch 36; the AUC peak was epoch 45. Train `total` goes 4.28 (ep1)
+-> 1.72 (ep21) -> 1.23 (ep46) -> 1.18 (ep101) with within-epoch spread 0.02-0.03: no
+oscillation, no spikes, so the LR is not too high, and the 4% move over 55 epochs says it
+is not starved either. The **train-val gap widens 0.28 (ep46) -> 0.49 (ep101)**. Textbook
+overfitting past a converged optimum. (The per-step figures come from the tqdm postfix, a
+running epoch mean, so they rule out instability but do not measure gradient noise.)
+
+**The LR-adjacent thing that is wrong:** `lr_decay_gamma: null` in *every* config in this
+repository, ever. Given that training converges by ~epoch 46 while validation degrades
+from ~36, a decay schedule is the standard response and has never been tried here. Also
+never resolved: v1 used **1e-3**, 3.3x higher, and the 3e-4 in every config traces to an
+early choice never validated at full scale on the current recipe.
+
+Two arms launched on the `rangeloss_depth1` recipe, 80 epochs, one-line diffs:
+`lr_decay_gamma: 0.97` (~0.09x LR by epoch 80) and `learning_rate: 1e-3`.
+
+### 6. Free Theta + per-sequence label: the arm that makes phi do the work
+
+With `theta_mode: "amortized"`, Theta is pooled from the same trunk that produces phi, so
+the TM term can be satisfied by moving Theta instead of phi -- and the two are coupled, as
+`AIRRTM_Model.forward`'s own docstring says: "the TM term ends up fighting itself".
+
+**A free Theta breaks that.** Theta becomes 30 numbers per repertoire with no sequence
+input, so the only way to fit `p(s|r) = sum_t theta_rt * exp(phi_ts)` is to make **phi**
+sequence-discriminative -- the pathway that was stuck at 0.86-1.09x until `usage_lower1`.
+Precedent: `budget_t60_reps597` was free-Theta and reached 0.023 nats, 10x any amortized
+run, but had no label loss so phi never learned which topics were signal.
+
+The existing guard rejects `label_input="repertoire"` + `theta_mode="free"` only, so
+**`free` + `sequence` is already legal** -- and is the better version: with
+`label_input: "sequence"` the label loss reads `sigmoid(phi)` and pushes on phi directly,
+and the MIL smooth-max over the bag becomes live instead of an identity. Held-out
+classification is not blocked because fold-in Theta scores unseen repertoires from frozen
+phi.
+
+Launched as a **pair**, because with `label_input: sequence` Theta's entire remaining job
+is an auxiliary unsupervised objective on phi:
+
+| arm | `theta_mode` | `label_input` | `tm_likelihood_coef` | what it is |
+|---|---|---|---|---|
+| A `freetheta_seqlabel_seed239` | `free` | `sequence` | 0.3 | Theta live, TM trains phi |
+| B `freetheta_seqlabel_notm_seed239` | `free` | `sequence` | **0.0** | identical, Theta inert -- plain MIL through phi |
+
+The intent was that arm B's Theta receives no gradient at all, so that **A - B is exactly
+the price of Theta** -- see the correction below, which is that this did not hold. This cannot be done with `use_topic_model: False`, which
+drops phi as well and forces `label_input: "repertoire"` -- the confound in every previous
+no-TM comparison in this document (which found +0.048 / +0.044 / +0.014 across three
+seeds, 3/3 directional against a +/-0.041 SE).
+
+**Neither arm tested the premise, and both are broken in the same way: phi's scale is
+unbounded.** `topic_l1_coef: 0.0` and `weight_decay: 0.0`, so nothing penalises the
+magnitude of phi, and it grows close to linearly from epoch 0 in both arms:
+
+| epoch | 0 | 10 | 20 | 30 | 40 | 50 | 53 | 60 | 70 |
+|---|---|---|---|---|---|---|---|---|---|
+| A `phi_l2` | 0.20 | 1.67 | 8.89 | 20.96 | 34.63 | 50.81 | **57.16** | NaN | -- |
+| B `phi_l2` | 0.35 | 0.83 | 2.14 | 4.52 | 11.06 | 25.58 | -- | 61.16 | 74.13 |
+
+The TM term is `logsumexp_t(log theta + phi)`, so at `||phi|| ~ 57` the `exp(phi)`
+overflows: **arm A died on the first step of epoch 54** (`RuntimeError: Non-finite loss`,
+`train.py:493` -- `total_loss`, `tm_loss`, `label_loss`, `kl_divergence` all NaN,
+`reconstruction_accuracy` 0.0438 at the failing step). Checkpoints survive to epoch 52.
+Arm B survived 80 epochs only because `tm_likelihood_coef: 0` keeps that logsumexp out of
+the gradient -- but its `tm_loss` still **rises from 10.41 to 26.3**, tracking `phi_l2`
+exactly. A term carrying no weight drifting 16 nats *worse* than chance is the same
+pathology, just harmless.
+
+**Arm A, up to the crash:**
+
+| epoch | 0 | 10 | 20 | 30 | 40 | 50 | 53 |
+|---|---|---|---|---|---|---|---|
+| `rec_acc` | 0.357 | 0.752 | 0.804 | 0.851 | 0.873 | 0.857 | 0.869 |
+| `tm` | 10.401 | 10.403 | 10.401 | 10.398 | 10.398 | 10.398 | 10.399 |
+| `label` | 0.3434 | 0.3432 | 0.3425 | 0.3421 | 0.3421 | 0.3422 | 0.3416 |
+| `label_acc` | 0.556 | 0.556 | 0.561 | 0.576 | 0.581 | 0.586 | 0.588 |
+
+Both arms reached `rec_acc` 0.75-0.80 by epoch 10 and arm A peaked at **0.873**, the
+second-best reconstruction recorded here, where amortized runs sit at 0.357 for their
+first ~20 epochs and reach ~0.5 by epoch 60. **Decoupling Theta from the shared trunk
+frees the VAE immediately**, which is the one part of the design that worked as argued.
+
+The other two terms did nothing. `tm` sat at chance (10.3972) for all 53 epochs despite
+`coef: 0.3` -- **the free-Theta TM gradient inflated phi rather than making it
+discriminative** -- and `label` moved 0.3434 -> 0.3416 against a chance of 0.3466, i.e.
+the classifier barely trained at all under `label_input: "sequence"`. So the arm's premise
+was never tested: phi did not become sequence-discriminative before the run diverged.
+
+**Correction to the control's design.** The config comment for arm B claims "entropy
+coefficients are 0 here too", and that is wrong: the file has `theta_entropy_coef: 0.5`
+and `topic_usage_coef: 5.0`, so Theta receives gradient from both entropy terms
+regardless of `tm_likelihood_coef`. `H_theta` falls 2.95 -> 1.99 across arm B's run,
+confirming Theta moved. **A - B is therefore not the price of Theta**, and the pair would
+have to be rerun with both entropy coefficients at 0 -- in addition to bounding phi -- for
+that comparison to mean anything.
+
+Arm B also overfits the label in the ordinary way: val `label` bottoms at 0.3391 (epoch
+45) then climbs to 0.4308, while train reaches 0.2426.
+
+**Before rerunning either arm: bound phi.** `topic_l1_coef` already exists and is 0 in
+every config in this repository; `weight_decay` is 0 everywhere too. This is the first
+configuration in the project where that has mattered, because it is the first where phi is
+the only object the TM term can move.
+
+### 7. State at the end of 2026-09-18, and what is running now
+
+All seven runs finished training. **No AUC curve had been scored for any of them** -- and
+in this project the training metrics have repeatedly failed to predict the curve, so none
+of these is decided. Best validation `label` loss (chance = 0.3466):
+
+| run | best `label` | @ep | best `label_acc` | note |
+|---|---|---|---|---|
+| `rangeloss_depth1_lrdecay_seed239` | **0.3245** | **78** | 0.619 | still improving at the budget |
+| `normloss_tm03_nowarm_seed3` | 0.3219 | 40 | 0.652 | |
+| `normloss_tm03_nowarm_seed1` | 0.3317 | 21 | 0.639 | |
+| `normloss_tm03_nowarm_seed2` | 0.3358 | 24 | 0.623 | |
+| `freetheta_seqlabel_notm_seed239` | 0.3391 | 45 | 0.606 | arm B |
+| `rangeloss_depth1_lr1e3_seed239` | 0.3402 | 12 | 0.589 | ends at 0.702 -- degrades hard |
+| `freetheta_seqlabel_seed239` | -- | -- | -- | **NaN crash at ~ep53** |
+
+The loss shape separates them more sharply than the best value does. Train `label` at
+epoch 79 against each run's val bottom:
+
+| run | val bottom | train at ep79 | train-val gap |
+|---|---|---|---|
+| `rangeloss_depth1_lrdecay` | 0.3259 (ep78) | 0.3124 | **0.013** |
+| `tm03_nowarm_seed3` | 0.3219 | 0.1300 | 0.306 |
+| `tm03_nowarm_seed1` | 0.3317 | 0.1401 | 0.294 |
+| `tm03_nowarm_seed2` | 0.3358 | 0.1220 | 0.404 |
+| `rangeloss_depth1_lr1e3` | 0.3402 | 0.1362 | 0.566 |
+
+The decay arm holds train and val 0.013 apart for 80 epochs where every other run opens a
+0.29-0.57 gap: it is not fitting harder, it is the only one not memorising. Its `rec_acc`
+still climbs to 0.655 and its `tm` stays pinned at 10.395 throughout, so the difference is
+confined to the label term.
+
+On the LR question the ordering at epoch 76 was **decay (0.3267) < constant (~0.43 by
+ep80) < 1e-3 (0.6716)**, and `lrdecay` is the only mature run in this document whose best
+epoch is its last -- consistent with the overfitting diagnosis. `lr_decay_gamma: null`
+looks like a real default bug rather than a neutral choice, pending the curves.
+
+**2026-09-19: all six completed runs launched for checkpoint-AUC curves** (40 checkpoints
+each, GPUs 0-5). Nothing else is running.
+
+### 8. Two things scoped out, and one thing that is 10 numbers wide
+
+**Scoped out by decision:** (D) restricting the TM to a public-clonotype vocabulary, and
+(E) a free per-clonotype phi table over that vocabulary. Both were proposed as the only
+mechanisms with a plausible route to per-sequence identification -- phi is
+`Linear(encoder(CDR3))`, a smooth function with **no per-clonotype parameter anywhere**,
+where a classical topic model has a free `beta (T x V)` table and Fisher has 3.5M
+independent per-clonotype tests. The consequence, recorded at the time: coefficient
+rebalancing and encoder capacity have both been swept hard and neither touches that
+limitation. `usage_lower1`'s 14.13x complicates that framing -- phi *can* carry
+attribution in at least one run -- but does not remove it, since nothing yet explains why
+that checkpoint and not its near-twin.
+
+Also worth noting against "increase model capacity": every capacity *increase* tested has
+been neutral or harmful (width 64->128 at both depths, heads 8->2, T 30->300, bigger
+encoder), and the only *decrease* -- depth 4 -> 1 -- produced the best margin in the
+project.
+
+**Never swept: `vae_coef`.** Every run in this session used 0.05. It is PLAN_v5 Stage 2,
+written into the plan and never executed, and it is the direct lever on `rec_acc`. Also
+never built: Stage 1, gradient-norm logging -- every rebalance so far has been done on
+loss-value arithmetic, which was wrong once already (chance vs range, 7.5x on tm).
+
+**The signal/non-signal split is 10/30 and has never been swept.** Only the total was
+varied (15/30/60/100/300), always at roughly 1:2. The classifier reads only the 10 signal
+topics (`airrtm_model.py:215`), the MIL input is `label_features_ST[:, :n_topics_signal]`
+(`:326`), both per-sequence readouts and `_compute_signal_topic_weights` use the same
+slice (`:569`, `:604`, `:626`), and the new `attention x value` pathway sums over those
+same 10 columns. So the entire label-relevant capacity of the model is 10 numbers per
+repertoire. v1 used 4 signal + 4 non-signal. A run with, say, 25 signal + 5 non-signal at
+the same total would test it directly for one GPU.
+
+**On generation:** `generation.py` generates *sequences*, not repertoires -- it takes the
+top-k by signal intensity, fits a diagonal Gaussian to their z, samples and decodes. Theta
+never appears, so generation is bottlenecked on phi. Repertoire generation needs
+`p(s|r) = sum_t theta_rt * p(s|t)`, and while theta_r is the only repertoire-level object
+in the model, **`p(s|t)` does not exist**: phi is discriminative and there is no
+`topic -> z` map. The missing piece is ~30 lines generalising `signal_latent_distribution`
+from "signal" to per-topic (`mu_t, sigma_t` over the z of sequences with high `phi_t`;
+then `t ~ theta_r`, `z ~ N(mu_t, sigma_t)`, decode). It needs both halves working: a
+collapsed Theta generates identical repertoires, and an uninformative phi makes every
+`mu_t` the same point.
