@@ -3900,3 +3900,40 @@ Also running: `tm03_nowarm_lrdecay_seed{239,1}` at gamma 0.99 on GPUs 6/7, curvi
 
 All eight arms are watched by detached chains that curve them and push the results to
 `analysis/results/` without supervision (see PLAN_v6's Continuity section).
+
+### 2026-09-20 00:00: the gentler decay is a null -- LR decay is finished as a lever
+
+`tm03_nowarm_lrdecay` at gamma 0.99 (0.67x LR by epoch 40, 0.45x by 80), on the best
+recipe, against that recipe's four constant-LR seeds. Bar 0.684:
+
+| run | best | @ep | margin | end of curve |
+|---|---|---|---|---|
+| parent seed 239 | **0.7904** | 40 | +0.106 | decays to ~0.72 |
+| parent seed 1 | 0.7690 | 12 | +0.085 | decays to 0.67 |
+| **decay 0.99 seed 239** | **0.7666** | 74 | +0.083 | **0.725, still up** |
+| parent seed 2 | 0.7542 | 62 | +0.070 | 0.700 |
+| parent seed 3 | 0.7411 | 46 | +0.057 | 0.693 |
+| **decay 0.99 seed 1** | 0.7164 | 56 | +0.032 | 0.665 |
+
+Decay mean **0.7415** (n=2) against the constant-LR mean **0.7637** (n=4). The two decay
+seeds straddle the parent spread -- one lands second-best of all six, the other last --
+and the difference between the means (-0.022) is smaller than the spread within either
+group. **No evidence of benefit at the gentler setting either.**
+
+What gamma 0.99 *does* change is the shape, exactly as intended and to no effect on the
+level. Seed 239's curve meanders at 0.63-0.72 through epoch 50, then holds **0.73-0.77
+from epoch 58 to 78** and ends at its high, where every constant-LR seed peaks earlier and
+decays. So the schedule does suppress the late drift; the suppressed drift was not where
+the AUC was.
+
+**Conclusion across three tests and two gammas: LR decay does not help this model.**
+0.97 on `rangeloss_depth1` cost 0.06 against an epoch-matched parent; 0.99 on
+`normloss_tm03_nowarm` is a null across two seeds. The `lr_decay_gamma: null` default
+that this document called "a real default bug" is, on the evidence, simply the right
+setting. The diagnosis it came from -- train converged while validation degraded -- was a
+correct reading of the loss and an incorrect prediction about the curve.
+
+`learning_rate` itself remains open only in the sense that 1e-3 was tested once and was
+worse (0.7052 vs 0.7544); nothing suggests spending more GPUs there.
+
+Raw curves: `analysis/results/curves_2026-09-19_lrdecay.md`.
