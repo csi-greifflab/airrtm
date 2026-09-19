@@ -58,6 +58,17 @@ training_config:
   # where every other run opened 0.29-0.57. This is that one-line change applied to
   # the best recipe. gamma 0.97 = 0.30x LR by the parent's AUC peak (ep40), 0.09x by
   # ep80. Architecture is unchanged, so the untrained bar is the parent's 0.684.
+  #
+  # GAMMA 0.97 -> 0.99 (2026-09-19, after the depth-1 decay curve landed). gamma 0.97
+  # on rangeloss_depth1 FAILED its epoch-matched test: peak 0.6935 (ep66) against the
+  # constant-LR parent's 0.7544 (ep45), same seed, same 80-epoch window, bar 0.6633 --
+  # margin +0.031 vs +0.091. Its curve is the shape decay promises (a late rise to a
+  # flat plateau, no decay tail) at a level 0.06 below the parent, i.e. the schedule
+  # settles the model into a worse basin rather than holding it at a better one. The
+  # label loss said the opposite (tightest train-val gap in the project, 0.013), which
+  # is the tm10x trap again: training metrics do not predict the curve.
+  # 0.99 is the gentler test: 0.67x LR by ep40 and 0.45x by ep80, against 0.97's 0.30x
+  # and 0.09x.
   device: "cuda:7"
   seed: 1
   n_epochs: 80
@@ -65,7 +76,7 @@ training_config:
   val_size: 0.1
   learning_rate: 0.0003
   weight_decay: 0.0
-  lr_decay_gamma: 0.97
+  lr_decay_gamma: 0.99
   grad_clip: 1.0
   # Bag size: at 1024, most CMV+ repertoires' 8192-sequence sample contains no
   # discriminative clonotype at all (FINDINGS.md hardware note); 8192 gets ~83%
