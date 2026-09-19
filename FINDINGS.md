@@ -3788,3 +3788,115 @@ from "signal" to per-topic (`mu_t, sigma_t` over the z of sequences with high `p
 then `t ~ theta_r`, `z ~ N(mu_t, sigma_t)`, decode). It needs both halves working: a
 collapsed Theta generates identical repertoires, and an uninformative phi makes every
 `mu_t` the same point.
+
+## 2026-09-19: LR decay fails its own test, the 0.7904 does not fully replicate, and the arm with no topic model is the best thing on the board
+
+Six curves, 40 checkpoints each (`checkpoint_every: 2`, epochs 0-78), all scored against
+the same held-out split. Raw curves are committed at
+`analysis/results/curves_2026-09-19_batch1.md`.
+
+### 1. LR decay: the loss shape was right and the AUC was worse anyway
+
+`rangeloss_depth1_lrdecay` (gamma 0.97) against its constant-LR parent, same seed, same
+architecture, same epoch window, a one-line diff:
+
+| epoch | 30 | 35 | 40 | **45** | 50 | 55 | 60 | 65 |
+|---|---|---|---|---|---|---|---|---|
+| parent, constant 3e-4 | .687 | .733 | .712 | **.754** | .725 | .734 | .739 | .712 |
+| gamma 0.97 | .684 | .667 | .667 | .669 | .649 | .681 | .684 | .686 |
+
+| run | best | @ep | bar | margin |
+|---|---|---|---|---|
+| parent `rangeloss_nowarm_depth1_seed239` | **0.7544** | 45 | 0.6633 | **+0.091** |
+| `rangeloss_depth1_lrdecay` (gamma 0.97) | 0.6935 | 66 | 0.6633 | +0.031 |
+| `rangeloss_depth1_lr1e3` | 0.7052 | 22 | 0.6633 | +0.042 |
+
+The decay arm's curve has **exactly the shape the schedule promises** -- a late rise from
+0.649 (ep50) to 0.694 (ep66) and then a flat plateau to epoch 78 with no decay tail. It
+is simply 0.06 below the parent the whole way. The schedule settles the model into a
+worse basin rather than holding it at a better one.
+
+**This is the `tm10x` trap a third time.** The decay arm had the best label loss on the
+board (0.3259, still falling at epoch 78) and the tightest train-val gap ever recorded
+here (0.013, against 0.29-0.57 for every other run), and it cost 0.06 of held-out AUC.
+`lr1e3` is the mirror image: train AUC 0.95 against test 0.64, blatant memorisation, and
+its *peak* still beats the decay arm's. **Stability of the label loss is not the
+objective and does not predict the curve.** Four interventions have now been judged on
+training metrics and reversed by the curve.
+
+Retest at **gamma 0.99** (0.67x LR by epoch 40, 0.45x by 80) launched on the
+`normloss_tm03_nowarm` recipe, two seeds. Not because the depth-1 result is ambiguous --
+it is not -- but because 0.97 may simply be too aggressive, and the gentler end of the
+lever has never been seen.
+
+### 2. The 0.7904 record is the top of a seed spread, not a level
+
+`normloss_tm03_nowarm`, four seeds now, bar 0.684:
+
+| seed | best | @ep | margin | curve shape |
+|---|---|---|---|---|
+| 239 (original) | **0.7904** | 40 | +0.106 | plateau ep10-70, then decays |
+| 1 | 0.7690 | 12 | +0.085 | peaks at ep12, decays to 0.63-0.69 after ep40 |
+| 2 | 0.7542 | 62 | +0.070 | dips to 0.66 mid-run, recovers late |
+| 3 | 0.7411 | 46 | +0.057 | flat 0.68-0.74 throughout |
+
+Mean 0.7637, and **no seed reproduces the 0.79**. The peak epochs are 40 / 12 / 62 / 46 --
+i.e. the peak is wherever the noise happens to put it, not a property of the recipe. The
+recipe is a genuine +0.08 over its bar on average, which is still the best replicated
+result here, but the record itself was the top of the spread.
+
+**A methodological problem this exposes, which applies to every number in this document.**
+The "best on curve" statistic is a **maximum over 40 checkpoints** whose epoch-to-epoch
+noise is ~0.04, while the untrained bar (0.6842) is a **mean over 5-7 independent draws**.
+Maximum-of-40 against mean-of-7 is not a fair comparison and is biased upward. The
+untrained control's own *maximum* was 0.7120. Read against that instead, the margins above
+become +0.078 / +0.057 / +0.042 / +0.029 -- still positive, considerably less impressive.
+Nothing in this document has been scored the fair way.
+
+### 3. The arm with no topic model at all is the best-behaved curve on the board
+
+`freetheta_seqlabel_notm_seed239` -- free Theta, `label_input: "sequence"`, and
+**`tm_likelihood_coef: 0`**, i.e. plain supervised MIL through phi with the topic model
+switched off:
+
+| epoch | 0 | 10 | 20 | 26 | 30 | 36 | 42 | 48 | **54** | 60 | 66 | 72 | 76 | 78 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| AUC | .677 | .693 | .704 | .732 | .745 | .742 | .747 | .719 | **.771** | .695 | .664 | .705 | .758 | .764 |
+
+**Best 0.7713 at epoch 54, ending at 0.7644 with no decay tail** -- it rises steadily from
+epoch 20 and stays up. Every topic-model run on this board spikes and then decays. This
+arm beats all three replicates of `normloss_tm03_nowarm` (0.769 / 0.754 / 0.741) and sits
+0.02 below the unreplicated 0.7904.
+
+Two things keep this from being a verdict:
+
+1. **n=1**, and the seed spread on the neighbouring recipe is 0.741-0.790.
+2. **This family has no untrained bar.** Its epoch-0 checkpoint scored 0.677, one draw.
+   The 0.684 bar belongs to a different architecture (amortized Theta, attention pooling,
+   `label_input: repertoire`), so the margin is not known.
+
+But the direction matters: **the one arm here that removes the topic model entirely is
+not worse than the recipe built around it, and its curve is better behaved.** That is the
+`use_topic_model` comparison this document has wanted since the beginning, and this time
+without the confound that sank the earlier one -- the previous no-TM runs had to switch
+to `label_input: "repertoire"`, which drops phi from the label path altogether. Here phi
+is the shared object and the only difference is the coefficient.
+
+### 4. Launched, 2026-09-19 23:15 -- six arms on GPUs 0-5
+
+| GPU | run | change | what it decides |
+|---|---|---|---|
+| 0, 1 | `freetheta_seqlabel_notm_seed{1,2}` | seed only | does the 0.7713 replicate |
+| 2 | `freetheta_phibound_tm03_seed239` | `phi_l2_coef: 0.01`, both entropy coefs -> 0 | the TM arm that went NaN, with phi bounded |
+| 3 | `freetheta_phibound_notm_seed239` | same | its matched control, so A - B is finally the price of Theta |
+| 4, 5 | `tm03_nowarm_vae{015,03}_seed239` | `vae_coef` 0.05 -> 0.15 / 0.3 | PLAN_v5 Stage 2, the only never-swept lever |
+
+`phi_l2 = (seq_topic_logits**2).mean()` and `phi_l2_coef` already exists in
+`CompositeLoss`; it is 0 in every config in this repository. At 0.01 it costs ~0.5 of loss
+at the `phi_l2 = 57` that killed the original arm -- enough to bound phi near O(10)
+without dominating a label term that sits at ~0.34.
+
+Also running: `tm03_nowarm_lrdecay_seed{239,1}` at gamma 0.99 on GPUs 6/7, curving now.
+
+All eight arms are watched by detached chains that curve them and push the results to
+`analysis/results/` without supervision (see PLAN_v6's Continuity section).
